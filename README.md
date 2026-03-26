@@ -2,8 +2,9 @@
 
 Inspect type definitions from Rust crate source code without building docs.
 
-Searches dependency crates and workspace member crates — including integration
-tests in `tests/`.
+Searches dependency crates and workspace member crates for structs, enums,
+unions, traits, type aliases, constants, statics, and functions — including
+integration tests in `tests/`.
 
 ## Installation
 
@@ -94,23 +95,31 @@ Found 7 matches for `Error`:
 - struct `serde_json::error::Error` at /home/user/.cargo/.../error.rs:15
 ```
 
-Crate overview — source path and item listing:
+Crate overview — source path, dependencies, and item listing:
 
 ```
-## `anyhow` v1.0.102
-**Source:** `/home/user/.cargo/registry/src/.../anyhow-1.0.102/src`
+## `serde_json` v1.0.149
+**Source:** `/home/user/.cargo/registry/src/.../serde_json-1.0.149/src`
+
+**Dependencies:** itoa, memchr, serde, serde_core, zmij
+
+**Workspace members (not yet deps):** my-utils, my-core
 
 Public items:
 
-- struct `Error`
-- struct `Chain`
-- type `Result`
-- trait `Context`
+- struct `de::Deserializer`
+- fn `de::from_reader`
+- fn `de::from_slice`
+- fn `de::from_str`
+- struct `error::Error`
+- enum `value::Value`
 
-Usage: `rspeek anyhow <Item>`
+Usage: `rspeek serde_json <Item>`
 ```
 
 For workspace members, all items are shown (not just public).
+**Dependencies** and **Workspace members (not yet deps)** help you discover
+what's already usable and what can be added with a one-line Cargo.toml edit.
 
 ### JSON output
 
@@ -160,6 +169,6 @@ Use `--llm-help` for extended usage documentation suitable for tool descriptions
 
 ## Limitations
 
-- Only finds items defined as regular Rust syntax (`struct`, `enum`, `trait`, `type`, `fn`)
+- Only finds items defined as regular Rust syntax (`struct`, `enum`, `union`, `trait`, `type`, `fn`, `const`, `static`)
 - Macro bodies are parsed for item definitions (e.g., syn's `ast_struct!`), but procedural macros and complex `macro_rules!` patterns are not expanded
 - Re-exports: `pub use` within a crate are followed; glob re-exports and cross-crate re-exports are not
