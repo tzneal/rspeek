@@ -71,7 +71,7 @@ rspeek --signature --impls anyhow Error
 
 Single match — full markdown with doc comments, source path, line number, crate version, and original source:
 
-```
+````
 ## `Error` (struct)
 **Source:** `/home/user/.cargo/registry/src/.../anyhow-1.0.102/src/lib.rs:288`
 **Crate:** `anyhow` v1.0.102
@@ -82,7 +82,7 @@ pub struct Error {
     inner: Own<ErrorImpl>,
 }
 ```
-```
+````
 
 Multiple matches — summary list with qualified paths and locations:
 
