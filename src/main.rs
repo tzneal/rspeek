@@ -99,7 +99,7 @@ error message (plain text) or in the "suggestions" array (JSON).
 
 ## Limitations
 
-- Only finds items defined as regular Rust syntax (struct, enum, trait, type, fn)
+- Only finds items defined as regular Rust syntax (struct, enum, union, trait, type, fn, const, static)
 - Macro bodies are parsed for item definitions (e.g. syn's ast_struct!), but
   procedural macros and complex macro_rules! patterns are not expanded
 - Re-exports: `pub use` within a crate are followed; glob re-exports and

@@ -554,6 +554,40 @@ impl<'ast> Visit<'ast> for ItemVisitor<'_> {
         syn::visit::visit_item_type(self, node);
     }
 
+    fn visit_item_union(&mut self, node: &'ast syn::ItemUnion) {
+        let start = doc_start(&node.attrs, node.span().start().line);
+        self.check(
+            &node.ident.to_string(),
+            "union",
+            is_pub(&node.vis),
+            start,
+            node.span().end().line,
+        );
+        syn::visit::visit_item_union(self, node);
+    }
+
+    fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
+        let start = doc_start(&node.attrs, node.span().start().line);
+        self.check(
+            &node.ident.to_string(),
+            "const",
+            is_pub(&node.vis),
+            start,
+            node.span().end().line,
+        );
+    }
+
+    fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
+        let start = doc_start(&node.attrs, node.span().start().line);
+        self.check(
+            &node.ident.to_string(),
+            "static",
+            is_pub(&node.vis),
+            start,
+            node.span().end().line,
+        );
+    }
+
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         let start = doc_start(&node.attrs, node.span().start().line);
         self.check(
@@ -597,5 +631,57 @@ impl<'ast> Visit<'ast> for ItemVisitor<'_> {
                 self.visit_item(item);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn collect_from_source(source: &str) -> Vec<IndexEntry> {
+        let dir = tempfile::tempdir().unwrap();
+        let lib_rs = dir.path().join("lib.rs");
+        let mut f = fs::File::create(&lib_rs).unwrap();
+        f.write_all(source.as_bytes()).unwrap();
+        collect(dir.path(), None, false, None).unwrap()
+    }
+
+    #[test]
+    fn finds_const() {
+        let entries = collect_from_source("pub const FOO: u32 = 42;");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "FOO");
+        assert_eq!(entries[0].kind, "const");
+    }
+
+    #[test]
+    fn finds_static() {
+        let entries = collect_from_source("pub static BAR: &str = \"hello\";");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "BAR");
+        assert_eq!(entries[0].kind, "static");
+    }
+
+    #[test]
+    fn finds_union() {
+        let entries = collect_from_source("pub union MyUnion { pub f1: u32, pub f2: f32 }");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "MyUnion");
+        assert_eq!(entries[0].kind, "union");
+    }
+
+    #[test]
+    fn pub_only_filters_private_const() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib_rs = dir.path().join("lib.rs");
+        fs::write(
+            &lib_rs,
+            "const PRIVATE: u32 = 1;\npub const PUBLIC: u32 = 2;",
+        )
+        .unwrap();
+        let entries = collect(dir.path(), None, true, None).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "PUBLIC");
     }
 }
