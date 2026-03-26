@@ -14,7 +14,6 @@
 # title/body based on your changelogs.
 
 name: Release
-
 permissions:
   "contents": "write"
 
@@ -39,7 +38,6 @@ permissions:
 #
 # If there's a prerelease-style suffix to the version, then the release(s)
 # will be marked as a prerelease.
-
 on:
   pull_request:
   push:
@@ -213,7 +211,6 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
-
   # Determines if we should publish/announce
   host:
     needs:
@@ -278,6 +275,7 @@ jobs:
         run: |
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
   announce:
