@@ -38,8 +38,9 @@ const LLM_HELP: &str = r#"# rspeek — inspect type definitions from Rust depend
 
 ## Usage
 
-rspeek is designed to be called by LLMs to look up structs, enums, traits,
-type aliases, and functions from Rust crates without building docs.
+rspeek is designed to be called by LLMs to look up structs, enums, unions,
+traits, type aliases, constants, statics, and functions from Rust crates
+without building docs.
 
 Run from any directory containing a Cargo.toml. Searches dependency crates
 and workspace member crates (including integration tests in `tests/`).
@@ -78,11 +79,25 @@ crate version, and the original source in a fenced code block.
 Multiple matches: summary list with kind, qualified path, and location.
 Narrow the search with a crate name or qualified path.
 
+## Crate overview
+
+`rspeek <crate>` lists public items and also shows:
+- **Dependencies**: direct deps of the crate (already in Cargo.toml)
+- **Workspace members (not yet deps)**: sibling crates that can be added
+  with a one-line Cargo.toml edit
+
+Use this to check what's already available before writing code from scratch.
+
 ## JSON output
 
 --json returns an array of objects:
   [{"name", "kind", "module_path", "file", "start_line", "end_line",
     "crate_name", "crate_version", "source", "impls"?}]
+
+Crate overview (rspeek --json <crate>) returns:
+  [{"crate_name", "crate_version", "src_dir", "items": [...],
+    "deps": ["anyhow", ...],
+    "available_workspace_members": ["my-utils", ...]}]
 
 Errors are also JSON: {"error": "...", "suggestions": ["..."]}
 
@@ -203,6 +218,8 @@ fn run(cli: &Cli) -> std::result::Result<(), NotFound> {
                             module_path: i.module_path,
                         })
                         .collect(),
+                    deps: c.deps.clone(),
+                    available_workspace_members: ws.available_members(&c.name, &c.deps),
                 });
             }
             println!("{}", serde_json::to_string(&overviews).unwrap());
@@ -217,6 +234,16 @@ fn run(cli: &Cli) -> std::result::Result<(), NotFound> {
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
+                if !c.deps.is_empty() {
+                    println!("**Dependencies:** {}\n", c.deps.join(", "));
+                }
+                let available = ws.available_members(&c.name, &c.deps);
+                if !available.is_empty() {
+                    println!(
+                        "**Workspace members (not yet deps):** {}\n",
+                        available.join(", ")
+                    );
+                }
                 let pub_only = !c.is_workspace_member;
                 let items = index::list_items(&c.source_dirs, pub_only, c.out_dir.as_deref())
                     .map_err(|e| NotFound {

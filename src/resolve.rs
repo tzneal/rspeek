@@ -13,6 +13,8 @@ pub struct ResolvedCrate {
     pub is_workspace_member: bool,
     /// Build script OUT_DIR, if the crate has been built.
     pub out_dir: Option<PathBuf>,
+    /// Direct dependency crate names.
+    pub deps: Vec<String>,
 }
 
 /// Normalize crate name for comparison (treat `-` and `_` as equivalent).
@@ -97,12 +99,14 @@ impl Workspace {
                     }
                 }
                 let out_dir = find_out_dir(metadata.target_directory.as_std_path(), &pkg.name);
+                let deps: Vec<String> = node.deps.iter().map(|d| d.name.clone()).collect();
                 crates.push(ResolvedCrate {
                     name: pkg.name.to_string(),
                     version: pkg.version.to_string(),
                     source_dirs,
                     is_workspace_member: is_member,
                     out_dir,
+                    deps,
                 });
             }
         }
@@ -126,6 +130,25 @@ impl Workspace {
         self.crates
             .iter()
             .filter(|c| normalize(&c.name) == norm)
+            .collect()
+    }
+
+    /// Names of all workspace member crates.
+    pub fn member_names(&self) -> Vec<&str> {
+        self.crates
+            .iter()
+            .filter(|c| c.is_workspace_member)
+            .map(|c| c.name.as_str())
+            .collect()
+    }
+
+    /// Workspace members that are not already dependencies of `crate_name`.
+    pub fn available_members(&self, crate_name: &str, deps: &[String]) -> Vec<String> {
+        let dep_set: HashSet<String> = deps.iter().map(|s| normalize(s)).collect();
+        self.member_names()
+            .into_iter()
+            .filter(|&m| m != crate_name && !dep_set.contains(&normalize(m)))
+            .map(|m| m.to_string())
             .collect()
     }
 }

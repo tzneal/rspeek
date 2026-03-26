@@ -35,6 +35,10 @@ pub struct JsonCrateOverview {
     pub crate_version: String,
     pub src_dir: String,
     pub items: Vec<JsonItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deps: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub available_workspace_members: Vec<String>,
 }
 
 #[derive(Serialize)]
