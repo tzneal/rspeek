@@ -1,0 +1,15 @@
+[package]
+name = "rspeek"
+version = "0.1.0"
+edition = "2021"
+description = "Quickly inspect type definitions from Rust dependency source code"
+
+[dependencies]
+cargo_metadata = "0.23"
+clap = { version = "4", features = ["derive"] }
+syn = { version = "2", features = ["full", "parsing", "visit"] }
+anyhow = "1"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+rayon = "1"
