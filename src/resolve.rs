@@ -99,7 +99,16 @@ impl Workspace {
                     }
                 }
                 let out_dir = find_out_dir(metadata.target_directory.as_std_path(), &pkg.name);
-                let deps: Vec<String> = node.deps.iter().map(|d| d.name.clone()).collect();
+                let deps: Vec<String> = node
+                    .deps
+                    .iter()
+                    .filter(|d| {
+                        d.dep_kinds
+                            .iter()
+                            .any(|k| k.kind == cargo_metadata::DependencyKind::Normal)
+                    })
+                    .map(|d| d.name.clone())
+                    .collect();
                 crates.push(ResolvedCrate {
                     name: pkg.name.to_string(),
                     version: pkg.version.to_string(),
