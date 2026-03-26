@@ -9,6 +9,7 @@ use clap::Parser;
 use index::IndexEntry;
 use rayon::prelude::*;
 use resolve::ResolvedCrate;
+use std::collections::HashSet;
 use std::process;
 
 /// Quickly inspect type definitions from Rust dependency source code.
@@ -180,10 +181,11 @@ fn run(cli: &Cli) -> std::result::Result<(), NotFound> {
             let mut overviews = Vec::new();
             for c in filtered {
                 let pub_only = !c.is_workspace_member;
-                let items = index::list_items(&c.source_dirs, pub_only).map_err(|e| NotFound {
-                    message: e.to_string(),
-                    suggestions: vec![],
-                })?;
+                let items = index::list_items(&c.source_dirs, pub_only, c.out_dir.as_deref())
+                    .map_err(|e| NotFound {
+                        message: e.to_string(),
+                        suggestions: vec![],
+                    })?;
                 overviews.push(output::JsonCrateOverview {
                     crate_name: c.name.clone(),
                     crate_version: c.version.clone(),
@@ -216,10 +218,11 @@ fn run(cli: &Cli) -> std::result::Result<(), NotFound> {
                         .join(", ")
                 );
                 let pub_only = !c.is_workspace_member;
-                let items = index::list_items(&c.source_dirs, pub_only).map_err(|e| NotFound {
-                    message: e.to_string(),
-                    suggestions: vec![],
-                })?;
+                let items = index::list_items(&c.source_dirs, pub_only, c.out_dir.as_deref())
+                    .map_err(|e| NotFound {
+                        message: e.to_string(),
+                        suggestions: vec![],
+                    })?;
                 if items.is_empty() {
                     println!("No items found.\n");
                 } else {
@@ -260,10 +263,11 @@ fn run(cli: &Cli) -> std::result::Result<(), NotFound> {
     let results: Vec<Result<Vec<(&ResolvedCrate, IndexEntry)>, _>> = search_crates
         .par_iter()
         .map(|c| {
-            let entries = index::index_crate(&c.source_dirs, item_name).map_err(|e| NotFound {
-                message: e.to_string(),
-                suggestions: vec![],
-            })?;
+            let entries = index::index_crate(&c.source_dirs, item_name, c.out_dir.as_deref())
+                .map_err(|e| NotFound {
+                    message: e.to_string(),
+                    suggestions: vec![],
+                })?;
             Ok(entries
                 .into_iter()
                 .filter(|entry| query.matches_module_path(&entry.module_path))
@@ -276,11 +280,17 @@ fn run(cli: &Cli) -> std::result::Result<(), NotFound> {
         matches.extend(r?);
     }
 
+    // Deduplicate entries pointing to the same source location, keeping the
+    // shortest module path (i.e. the re-exported, user-facing path).
+    matches.sort_by_key(|(_, a)| a.module_path.len());
+    let mut seen = HashSet::new();
+    matches.retain(|(_, e)| seen.insert((e.file.clone(), e.start_line, e.end_line)));
+
     if matches.is_empty() {
         let all_names: Vec<String> = search_crates
             .iter()
             .flat_map(|c| {
-                index::list_items(&c.source_dirs, !c.is_workspace_member)
+                index::list_items(&c.source_dirs, !c.is_workspace_member, c.out_dir.as_deref())
                     .unwrap_or_default()
                     .into_iter()
                     .map(|e| e.name)
@@ -298,7 +308,10 @@ fn run(cli: &Cli) -> std::result::Result<(), NotFound> {
             .iter()
             .map(|(c, entry)| {
                 let impls = if cli.impls {
-                    Some(index::find_impls(&c.source_dirs, &entry.name).unwrap_or_default())
+                    Some(
+                        index::find_impls(&c.source_dirs, &entry.name, c.out_dir.as_deref())
+                            .unwrap_or_default(),
+                    )
                 } else {
                     None
                 };
@@ -313,7 +326,10 @@ fn run(cli: &Cli) -> std::result::Result<(), NotFound> {
     } else if matches.len() == 1 {
         let (c, entry) = &matches[0];
         let impls = if cli.impls {
-            Some(index::find_impls(&c.source_dirs, &entry.name).unwrap_or_default())
+            Some(
+                index::find_impls(&c.source_dirs, &entry.name, c.out_dir.as_deref())
+                    .unwrap_or_default(),
+            )
         } else {
             None
         };

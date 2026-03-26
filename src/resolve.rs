@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use cargo_metadata::MetadataCommand;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A resolved crate with its source location.
 #[derive(Debug)]
@@ -11,11 +11,49 @@ pub struct ResolvedCrate {
     /// Directories to search for items (typically `src/`, and `tests/` for workspace members).
     pub source_dirs: Vec<PathBuf>,
     pub is_workspace_member: bool,
+    /// Build script OUT_DIR, if the crate has been built.
+    pub out_dir: Option<PathBuf>,
 }
 
 /// Normalize crate name for comparison (treat `-` and `_` as equivalent).
 fn normalize(name: &str) -> String {
     name.replace('-', "_")
+}
+
+/// Find the OUT_DIR for a crate by scanning `<target_dir>/*/build/<crate>-*/out/`.
+/// Returns the most recently modified match if multiple exist.
+fn find_out_dir(target_dir: &Path, crate_name: &str) -> Option<PathBuf> {
+    let prefix = format!("{crate_name}-");
+    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+    // Check all profile dirs (debug, release, etc.)
+    let Ok(profiles) = std::fs::read_dir(target_dir) else {
+        return None;
+    };
+    for profile in profiles.flatten() {
+        let build_dir = profile.path().join("build");
+        let Ok(entries) = std::fs::read_dir(&build_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            if !name_str.starts_with(&prefix) {
+                continue;
+            }
+            let out = entry.path().join("out");
+            if out.is_dir() {
+                let mtime = std::fs::metadata(&out)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
+                    best = Some((out, mtime));
+                }
+            }
+        }
+    }
+    best.map(|(p, _)| p)
 }
 
 /// All resolved crates from `cargo metadata`.
@@ -58,11 +96,13 @@ impl Workspace {
                         source_dirs.push(tests_dir);
                     }
                 }
+                let out_dir = find_out_dir(metadata.target_directory.as_std_path(), &pkg.name);
                 crates.push(ResolvedCrate {
                     name: pkg.name.to_string(),
                     version: pkg.version.to_string(),
                     source_dirs,
                     is_workspace_member: is_member,
+                    out_dir,
                 });
             }
         }

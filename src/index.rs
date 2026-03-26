@@ -28,29 +28,43 @@ pub struct ImplBlock {
 }
 
 /// Build an index of items under `dirs` matching `item_name`.
-pub fn index_crate(dirs: &[PathBuf], item_name: &str) -> Result<Vec<IndexEntry>> {
+pub fn index_crate(
+    dirs: &[PathBuf],
+    item_name: &str,
+    out_dir: Option<&Path>,
+) -> Result<Vec<IndexEntry>> {
     let mut entries = Vec::new();
     for dir in dirs {
-        entries.extend(collect(dir, Some(item_name), false)?);
+        entries.extend(collect(dir, Some(item_name), false, out_dir)?);
     }
     Ok(entries)
 }
 
 /// List all items under `dirs`. If `pub_only` is true, only public items.
-pub fn list_items(dirs: &[PathBuf], pub_only: bool) -> Result<Vec<IndexEntry>> {
+pub fn list_items(
+    dirs: &[PathBuf],
+    pub_only: bool,
+    out_dir: Option<&Path>,
+) -> Result<Vec<IndexEntry>> {
     let mut entries = Vec::new();
     for dir in dirs {
-        entries.extend(collect(dir, None, pub_only)?);
+        entries.extend(collect(dir, None, pub_only, out_dir)?);
     }
     Ok(entries)
 }
 
 /// Find all `impl` blocks for `type_name` under `dirs`.
-pub fn find_impls(dirs: &[PathBuf], type_name: &str) -> Result<Vec<ImplBlock>> {
-    let files = dirs
-        .iter()
-        .flat_map(|d| gather_rs_files(d))
-        .collect::<Vec<_>>();
+pub fn find_impls(
+    dirs: &[PathBuf],
+    type_name: &str,
+    out_dir: Option<&Path>,
+) -> Result<Vec<ImplBlock>> {
+    let mut files: Vec<PathBuf> = dirs.iter().flat_map(|d| gather_rs_files(d)).collect();
+    if let Some(od) = out_dir {
+        if od.is_dir() {
+            files.extend(gather_rs_files(od));
+        }
+    }
     let impls: Vec<ImplBlock> = files
         .par_iter()
         .flat_map(|path| find_impls_in_file(path, type_name).unwrap_or_default())
@@ -99,7 +113,12 @@ fn impl_is_for(imp: &syn::ItemImpl, type_name: &str) -> bool {
     }
 }
 
-fn collect(src_dir: &Path, name_filter: Option<&str>, pub_only: bool) -> Result<Vec<IndexEntry>> {
+fn collect(
+    src_dir: &Path,
+    name_filter: Option<&str>,
+    pub_only: bool,
+    out_dir: Option<&Path>,
+) -> Result<Vec<IndexEntry>> {
     let mut entries = Vec::new();
     let mut reexports = Vec::new();
     let mut visited = HashSet::new();
@@ -115,6 +134,7 @@ fn collect(src_dir: &Path, name_filter: Option<&str>, pub_only: bool) -> Result<
             src_dir,
             name_filter,
             pub_only,
+            out_dir,
             &mut entries,
             &mut reexports,
             &mut visited,
@@ -128,6 +148,7 @@ fn collect(src_dir: &Path, name_filter: Option<&str>, pub_only: bool) -> Result<
         "",
         name_filter,
         pub_only,
+        out_dir,
         &mut entries,
         &mut reexports,
         &mut visited,
@@ -199,11 +220,13 @@ fn reexport_path_matches(entry_module_path: &str, source_segments: &[String]) ->
     entry_module_path == expected || entry_module_path.ends_with(&format!("::{expected}"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn index_file(
     path: &Path,
     module_path: &str,
     name_filter: Option<&str>,
     pub_only: bool,
+    out_dir: Option<&Path>,
     entries: &mut Vec<IndexEntry>,
     reexports: &mut Vec<ReExport>,
     visited: &mut HashSet<PathBuf>,
@@ -225,9 +248,26 @@ fn index_file(
         pub_only,
         module_path: module_path.to_string(),
         file_path: path.to_path_buf(),
+        out_dir: out_dir.map(Path::to_path_buf),
         entries,
+        included_files: Vec::new(),
     };
     visitor.visit_file(&file);
+    let included_files = std::mem::take(&mut visitor.included_files);
+
+    // Index any files discovered via include!() macros
+    for (inc_path, inc_module) in included_files {
+        index_file(
+            &inc_path,
+            &inc_module,
+            name_filter,
+            pub_only,
+            out_dir,
+            entries,
+            reexports,
+            visited,
+        )?;
+    }
 
     // Collect `pub use` re-exports and follow `mod` declarations
     let parent_dir = path.parent().unwrap();
@@ -250,6 +290,7 @@ fn index_file(
                         &child_mod,
                         name_filter,
                         pub_only,
+                        out_dir,
                         entries,
                         reexports,
                         visited,
@@ -347,6 +388,7 @@ fn walk_all_rs(
     dir: &Path,
     name_filter: Option<&str>,
     pub_only: bool,
+    out_dir: Option<&Path>,
     entries: &mut Vec<IndexEntry>,
     reexports: &mut Vec<ReExport>,
     visited: &mut HashSet<PathBuf>,
@@ -355,13 +397,22 @@ fn walk_all_rs(
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            walk_all_rs(&path, name_filter, pub_only, entries, reexports, visited)?;
+            walk_all_rs(
+                &path,
+                name_filter,
+                pub_only,
+                out_dir,
+                entries,
+                reexports,
+                visited,
+            )?;
         } else if path.extension().is_some_and(|e| e == "rs") {
             index_file(
                 &path,
                 "",
                 name_filter,
                 pub_only,
+                out_dir,
                 entries,
                 reexports,
                 visited,
@@ -376,7 +427,10 @@ struct ItemVisitor<'a> {
     pub_only: bool,
     module_path: String,
     file_path: PathBuf,
+    out_dir: Option<PathBuf>,
     entries: &'a mut Vec<IndexEntry>,
+    /// Files discovered via `include!()` that need indexing after the visit.
+    included_files: Vec<(PathBuf, String)>,
 }
 
 impl ItemVisitor<'_> {
@@ -402,6 +456,44 @@ impl ItemVisitor<'_> {
 
 fn is_pub(vis: &syn::Visibility) -> bool {
     matches!(vis, syn::Visibility::Public(_))
+}
+
+/// Resolve the path argument of an `include!()` macro invocation.
+/// Handles `include!("path.rs")` and `include!(concat!(env!("OUT_DIR"), "/file.rs"))`.
+fn resolve_include_path(
+    tokens: &proc_macro2::TokenStream,
+    out_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Ok(lit) = syn::parse2::<syn::LitStr>(tokens.clone()) {
+        return Some(PathBuf::from(lit.value()));
+    }
+    // For concat!(env!("OUT_DIR"), ...), work with the string representation
+    // which is predictable: `concat ! (env ! ("OUT_DIR") , "/file.rs")`
+    let s = tokens.to_string();
+    if !s.starts_with("concat") {
+        return None;
+    }
+    let out_str = out_dir?.to_string_lossy();
+    let resolved = s
+        // Strip the concat!(...) wrapper
+        .strip_prefix("concat")?
+        .trim()
+        .strip_prefix("!")?
+        .trim()
+        .strip_prefix("(")?
+        .strip_suffix(")")?;
+    let mut result = String::new();
+    for piece in resolved.split(',') {
+        let piece = piece.trim();
+        if piece.contains("env") && piece.contains("OUT_DIR") {
+            result.push_str(&out_str);
+        } else if let Ok(lit) = syn::parse_str::<syn::LitStr>(piece) {
+            result.push_str(&lit.value());
+        } else {
+            return None;
+        }
+    }
+    Some(PathBuf::from(result))
 }
 
 fn doc_start(attrs: &[syn::Attribute], item_start: usize) -> usize {
@@ -488,6 +580,15 @@ impl<'ast> Visit<'ast> for ItemVisitor<'_> {
     }
 
     fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
+        // Handle include!() by resolving the path and queuing the file for indexing.
+        if node.mac.path.is_ident("include") {
+            if let Some(path) = resolve_include_path(&node.mac.tokens, self.out_dir.as_deref()) {
+                if path.exists() {
+                    self.included_files.push((path, self.module_path.clone()));
+                    return;
+                }
+            }
+        }
         // Try to parse the macro body as Rust items.
         // Handles patterns like: ast_struct! { pub struct Foo { ... } }
         let tokens = node.mac.tokens.clone();
