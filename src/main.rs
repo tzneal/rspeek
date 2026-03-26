@@ -32,6 +32,9 @@ struct Cli {
     /// Show only signatures (no function bodies)
     #[arg(long)]
     signature: bool,
+    /// Shorthand for --signature --impls (type API at a glance)
+    #[arg(long)]
+    api: bool,
 }
 
 const LLM_HELP: &str = r#"# rspeek — inspect type definitions from Rust dependency source code
@@ -57,6 +60,7 @@ and workspace member crates (including integration tests in `tests/`).
   --json       Output as JSON (structured output for programmatic use)
   --impls      Include impl blocks for matched types
   --signature  Show only signatures (no function/method bodies)
+  --api        Shorthand for --signature --impls (type API at a glance)
   --llm-help   Print this help text
 
 ## Examples
@@ -69,7 +73,7 @@ and workspace member crates (including integration tests in `tests/`).
   rspeek --json anyhow Error        JSON output with source code
   rspeek --impls anyhow Error       Include all impl blocks
   rspeek --signature anyhow Error   Signatures only (no fn bodies)
-  rspeek --signature --impls anyhow Error  Signatures for type + impl methods
+  rspeek --api anyhow Error         Signatures for type + all impl methods
 
 ## Output
 
@@ -128,7 +132,11 @@ struct NotFound {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    if cli.api {
+        cli.signature = true;
+        cli.impls = true;
+    }
 
     if let Err(e) = run(&cli) {
         if cli.json {
