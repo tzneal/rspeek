@@ -505,6 +505,14 @@ fn doc_start(attrs: &[syn::Attribute], item_start: usize) -> usize {
         .unwrap_or(item_start)
 }
 
+/// Check if a macro path is `include_proto`, `tonic::include_proto`, or `prost::include_proto`.
+fn is_include_proto(path: &syn::Path) -> bool {
+    let segs: Vec<_> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+    segs == ["include_proto"]
+        || segs == ["tonic", "include_proto"]
+        || segs == ["prost", "include_proto"]
+}
+
 impl<'ast> Visit<'ast> for ItemVisitor<'_> {
     fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
         let start = doc_start(&node.attrs, node.span().start().line);
@@ -620,6 +628,18 @@ impl<'ast> Visit<'ast> for ItemVisitor<'_> {
                 if path.exists() {
                     self.included_files.push((path, self.module_path.clone()));
                     return;
+                }
+            }
+        }
+        // Handle tonic::include_proto!("package.name") → OUT_DIR/package.name.rs
+        if is_include_proto(&node.mac.path) {
+            if let Some(out_dir) = &self.out_dir {
+                if let Ok(lit) = syn::parse2::<syn::LitStr>(node.mac.tokens.clone()) {
+                    let path = out_dir.join(format!("{}.rs", lit.value()));
+                    if path.exists() {
+                        self.included_files.push((path, self.module_path.clone()));
+                        return;
+                    }
                 }
             }
         }
