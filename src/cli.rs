@@ -283,11 +283,16 @@ fn run_item_search(
     let results: Vec<Result<Vec<(&ResolvedCrate, IndexEntry)>, _>> = search_crates
         .par_iter()
         .map(|c| {
-            let entries = index::index_crate(&c.source_dirs, item_name, c.out_dir.as_deref())
-                .map_err(|e| NotFound {
-                    message: e.to_string(),
-                    suggestions: vec![],
-                })?;
+            let entries = index::index_crate(
+                &c.source_dirs,
+                item_name,
+                !c.is_workspace_member,
+                c.out_dir.as_deref(),
+            )
+            .map_err(|e| NotFound {
+                message: e.to_string(),
+                suggestions: vec![],
+            })?;
             Ok(entries
                 .into_iter()
                 .filter(|entry| query.matches_module_path(&entry.module_path))

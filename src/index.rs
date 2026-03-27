@@ -31,11 +31,12 @@ pub struct ImplBlock {
 pub fn index_crate(
     dirs: &[PathBuf],
     item_name: &str,
+    pub_only: bool,
     out_dir: Option<&Path>,
 ) -> Result<Vec<IndexEntry>> {
     let mut entries = Vec::new();
     for dir in dirs {
-        entries.extend(collect(dir, Some(item_name), false, out_dir)?);
+        entries.extend(collect(dir, Some(item_name), pub_only, out_dir)?);
     }
     Ok(entries)
 }
@@ -689,6 +690,23 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "MyUnion");
         assert_eq!(entries[0].kind, "union");
+    }
+
+    #[test]
+    fn index_crate_filters_pub_crate_in_child_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        // lib.rs: public struct + private mod with pub(crate) struct of same name
+        fs::write(src.join("lib.rs"), "pub struct Chain;\nmod inner;").unwrap();
+        fs::write(src.join("inner.rs"), "pub(crate) struct Chain;").unwrap();
+        let entries = index_crate(&[src], "Chain", true, None).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected only the pub struct, got: {entries:?}"
+        );
+        assert_eq!(entries[0].module_path, "");
     }
 
     #[test]
