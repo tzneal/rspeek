@@ -37,6 +37,7 @@ rspeek <crate>::<path>::<Item>    Match by module path
 - `--impls` — include impl blocks for matched types
 - `--signature` — show only signatures (no function/method bodies)
 - `--api` — shorthand for `--signature --impls` (type API at a glance)
+- `--crate-version <VERSION>` — filter to a specific crate version (accepts `v` prefix)
 - `--llm-help` — extended usage documentation for LLM tool integration
 
 ## Examples
@@ -67,6 +68,9 @@ rspeek --signature anyhow Error
 
 # Signatures for type + impl methods
 rspeek --signature --impls anyhow Error
+
+# Pin a specific crate version
+rspeek --crate-version 0.29.0 nix kill
 ```
 
 ## Output
@@ -86,14 +90,16 @@ pub struct Error {
 ```
 ````
 
-Multiple matches — summary list with qualified paths and locations:
+Multiple matches — summary list with qualified paths and locations.
+When the same item exists in multiple versions of a crate, only the newest
+is shown with the other versions noted:
 
 ```
 Found 7 matches for `Error`:
 
-- struct `anyhow::Error` at /home/user/.cargo/.../lib.rs:288
-- enum `cargo_metadata::errors::Error` at /home/user/.cargo/.../errors.rs:6
-- struct `serde_json::error::Error` at /home/user/.cargo/.../error.rs:15
+- struct `anyhow::Error` v1.0.102 at /home/user/.cargo/.../lib.rs:288
+- enum `cargo_metadata::errors::Error` v0.23.1 at /home/user/.cargo/.../errors.rs:6
+- struct `serde_json::error::Error` v1.0.149 at /home/user/.cargo/.../error.rs:15 (also in v1.0.140, v1.0.145)
 ```
 
 Crate overview — source path, dependencies, and item listing:
@@ -137,11 +143,13 @@ what's already usable and what can be added with a one-line Cargo.toml edit.
   "crate_name": "anyhow",
   "crate_version": "1.0.102",
   "source": "pub struct Error { ... }",
-  "impls": [{"trait_name": null, "file": "...", "start_line": 19, "end_line": 670, "source": "..."}]
+  "impls": [{"trait_name": null, "file": "...", "start_line": 19, "end_line": 670, "source": "..."}],
+  "other_versions": ["1.0.98", "1.0.100"]
 }]
 ```
 
 The `impls` field is only present when `--impls` is used.
+The `other_versions` field is only present when older versions were collapsed.
 
 Errors are also JSON when `--json` is set:
 

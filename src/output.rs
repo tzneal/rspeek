@@ -18,6 +18,8 @@ pub struct JsonEntry {
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub impls: Option<Vec<JsonImplBlock>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub other_versions: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -266,6 +268,7 @@ pub fn to_json_entry(
     krate: &ResolvedCrate,
     impls: Option<&[ImplBlock]>,
     signature: bool,
+    other_versions: Vec<String>,
 ) -> Result<JsonEntry> {
     let source = read_source(entry)?;
     let source = if signature {
@@ -284,6 +287,7 @@ pub fn to_json_entry(
         crate_version: krate.version.clone(),
         source,
         impls: impls.map(|i| to_json_impls(i, signature)).transpose()?,
+        other_versions,
     })
 }
 
@@ -293,6 +297,7 @@ pub fn format_entry(
     krate: &ResolvedCrate,
     impls: Option<&[ImplBlock]>,
     signature: bool,
+    other_versions: &[String],
 ) -> Result<String> {
     let source = read_source(entry)?;
     let source = if signature {
@@ -303,19 +308,25 @@ pub fn format_entry(
     let mut out = format!(
         "## `{}` ({})\n\
          **Source:** `{}:{}`\n\
-         **Crate:** `{}` v{}\n\
-         \n\
-         ```rust\n\
-         {}\n\
-         ```",
+         **Crate:** `{}` v{}\n",
         entry.name,
         entry.kind,
         entry.file.display(),
         entry.start_line,
         krate.name,
         krate.version,
-        source,
     );
+    if !other_versions.is_empty() {
+        out.push_str(&format!(
+            "**Also in:** {}\n",
+            other_versions
+                .iter()
+                .map(|v| format!("v{v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    out.push_str(&format!("\n```rust\n{}\n```", source,));
 
     if let Some(impls) = impls {
         for imp in impls {
