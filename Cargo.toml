@@ -7,6 +7,9 @@ repository = "https://github.com/tzneal/rspeek"
 license = "MIT"
 publish = false
 
+[package.metadata.dist]
+dist = true
+
 [dependencies]
 cargo_metadata = "0.23"
 clap = { version = "4", features = ["derive"] }
