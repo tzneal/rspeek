@@ -36,6 +36,7 @@ rspeek <crate>::<path>::<Item>    Match by module path
 - `--json` — structured JSON output (for LLMs and scripts)
 - `--impls` — include impl blocks for matched types
 - `--signature` — show only signatures (no function/method bodies)
+- `--api` — shorthand for `--signature --impls` (type API at a glance)
 - `--llm-help` — extended usage documentation for LLM tool integration
 
 ## Examples
