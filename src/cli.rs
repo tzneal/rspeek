@@ -33,6 +33,9 @@ pub struct Cli {
     /// Shorthand for --signature --impls (type API at a glance)
     #[arg(long)]
     pub api: bool,
+    /// Filter to a specific crate version (e.g. --crate-version 0.29.0)
+    #[arg(long)]
+    pub crate_version: Option<String>,
 }
 
 /// Error with optional suggestions for "did you mean?" messages.
@@ -66,6 +69,7 @@ and workspace member crates (including integration tests in `tests/`).
   --impls      Include impl blocks for matched types
   --signature  Show only signatures (no function/method bodies)
   --api        Shorthand for --signature --impls (type API at a glance)
+  --crate-version <VERSION>  Filter to a specific crate version
   --llm-help   Print this help text
 
 ## Examples
@@ -79,6 +83,7 @@ and workspace member crates (including integration tests in `tests/`).
   rspeek --impls anyhow Error       Include all impl blocks
   rspeek --signature anyhow Error   Signatures only (no fn bodies)
   rspeek --api anyhow Error         Signatures for type + all impl methods
+  rspeek --crate-version 0.29.0 nix kill  Pin a specific crate version
 
 ## Output
 
@@ -101,7 +106,7 @@ Use this to check what's already available before writing code from scratch.
 
 --json returns an array of objects:
   [{\"name\", \"kind\", \"module_path\", \"file\", \"start_line\", \"end_line\",
-    \"crate_name\", \"crate_version\", \"source\", \"impls\"?}]
+    \"crate_name\", \"crate_version\", \"source\", \"impls\"?, \"other_versions\"?}]
 
 Crate overview (rspeek --json <crate>) returns:
   [{\"crate_name\", \"crate_version\", \"src_dir\", \"items\": [...],
@@ -257,6 +262,69 @@ fn run_crate_overview(
     Ok(())
 }
 
+/// When the same item appears in multiple versions of the same crate, keep only
+/// the newest version. Returns the deduped matches and a parallel vec of other
+/// versions that were collapsed into each kept entry.
+fn dedup_versions(
+    matches: Vec<(&ResolvedCrate, IndexEntry)>,
+) -> (Vec<(&ResolvedCrate, IndexEntry)>, Vec<Vec<String>>) {
+    use cargo_metadata::semver::Version;
+    use std::collections::HashMap;
+
+    // Group indices by (crate_name, item_name, module_path).
+    let mut groups: HashMap<(&str, &str, &str), Vec<usize>> = HashMap::new();
+    for (i, (c, entry)) in matches.iter().enumerate() {
+        groups
+            .entry((&c.name, &entry.name, &entry.module_path))
+            .or_default()
+            .push(i);
+    }
+
+    let mut skip = HashSet::new();
+    // Map from kept index -> list of other version strings.
+    let mut others: HashMap<usize, Vec<String>> = HashMap::new();
+    for indices in groups.values() {
+        if indices.len() <= 1 {
+            continue;
+        }
+        let best = *indices
+            .iter()
+            .max_by(|&&a, &&b| {
+                let va = Version::parse(&matches[a].0.version).ok();
+                let vb = Version::parse(&matches[b].0.version).ok();
+                va.cmp(&vb)
+            })
+            .unwrap();
+        let mut vers: Vec<String> = indices
+            .iter()
+            .filter(|&&i| i != best)
+            .map(|&i| matches[i].0.version.clone())
+            .collect();
+        vers.sort_by(|a, b| {
+            Version::parse(a)
+                .unwrap_or(Version::new(0, 0, 0))
+                .cmp(&Version::parse(b).unwrap_or(Version::new(0, 0, 0)))
+        });
+        others.insert(best, vers);
+        for &i in indices {
+            if i != best {
+                skip.insert(i);
+            }
+        }
+    }
+
+    let mut deduped = Vec::new();
+    let mut other_versions = Vec::new();
+    for (i, m) in matches.into_iter().enumerate() {
+        if skip.contains(&i) {
+            continue;
+        }
+        other_versions.push(others.remove(&i).unwrap_or_default());
+        deduped.push(m);
+    }
+    (deduped, other_versions)
+}
+
 fn run_item_search(
     cli: &Cli,
     ws: &resolve::Workspace,
@@ -266,7 +334,7 @@ fn run_item_search(
     let item_name = query.item_name().unwrap();
     let search_crates: Vec<&ResolvedCrate> = match query.crate_filter() {
         Some(name) => {
-            let filtered = ws.filter(name);
+            let mut filtered = ws.filter(name);
             if filtered.is_empty() {
                 let crate_names: Vec<String> = ws.crates.iter().map(|c| c.name.clone()).collect();
                 return Err(not_found(
@@ -274,6 +342,21 @@ fn run_item_search(
                     name,
                     &crate_names,
                 ));
+            }
+            if let Some(ver) = &cli.crate_version {
+                let ver = ver.strip_prefix('v').unwrap_or(ver);
+                filtered.retain(|c| c.version == *ver);
+                if filtered.is_empty() {
+                    let versions: Vec<String> =
+                        ws.filter(name).iter().map(|c| c.version.clone()).collect();
+                    return Err(NotFound {
+                        message: format!(
+                            "version `{ver}` not found for crate `{name}`. Available: {}",
+                            versions.join(", ")
+                        ),
+                        suggestions: versions,
+                    });
+                }
             }
             filtered
         }
@@ -311,6 +394,9 @@ fn run_item_search(
     let mut seen = HashSet::new();
     matches.retain(|(_, e)| seen.insert((e.file.clone(), e.start_line, e.end_line)));
 
+    // When the same item exists in multiple versions of a crate, keep the newest.
+    let (matches, other_versions) = dedup_versions(matches);
+
     if matches.is_empty() {
         let all_names: Vec<String> = search_crates
             .iter()
@@ -331,7 +417,8 @@ fn run_item_search(
     if cli.json {
         let json_entries: Vec<output::JsonEntry> = matches
             .iter()
-            .map(|(c, entry)| {
+            .enumerate()
+            .map(|(i, (c, entry))| {
                 let impls = if cli.impls {
                     Some(
                         index::find_impls(&c.source_dirs, &entry.name, c.out_dir.as_deref())
@@ -340,7 +427,13 @@ fn run_item_search(
                 } else {
                     None
                 };
-                output::to_json_entry(entry, c, impls.as_deref(), cli.signature)
+                output::to_json_entry(
+                    entry,
+                    c,
+                    impls.as_deref(),
+                    cli.signature,
+                    other_versions[i].clone(),
+                )
             })
             .collect::<Result<_>>()
             .map_err(|e| NotFound {
@@ -359,11 +452,16 @@ fn run_item_search(
             None
         };
         out.println(
-            &output::format_entry(entry, c, impls.as_deref(), cli.signature).map_err(|e| {
-                NotFound {
-                    message: e.to_string(),
-                    suggestions: vec![],
-                }
+            &output::format_entry(
+                entry,
+                c,
+                impls.as_deref(),
+                cli.signature,
+                &other_versions[0],
+            )
+            .map_err(|e| NotFound {
+                message: e.to_string(),
+                suggestions: vec![],
             })?,
         );
     } else {
@@ -372,20 +470,34 @@ fn run_item_search(
             matches.len(),
             item_name
         ));
-        for (c, entry) in &matches {
+        for (i, (c, entry)) in matches.iter().enumerate() {
             let mod_display = if entry.module_path.is_empty() {
                 String::new()
             } else {
                 format!("::{}", entry.module_path)
             };
+            let ver_note = if other_versions[i].is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (also in {})",
+                    other_versions[i]
+                        .iter()
+                        .map(|v| format!("v{v}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
             out.println(&format!(
-                "- {} `{}{}::{}` at {}:{}",
+                "- {} `{}{}::{}` v{} at {}:{}{}",
                 entry.kind,
                 c.name,
                 mod_display,
                 entry.name,
+                c.version,
                 entry.file.display(),
                 entry.start_line,
+                ver_note,
             ));
         }
     }
