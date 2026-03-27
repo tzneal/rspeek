@@ -4,6 +4,8 @@ version = "0.1.2"
 edition = "2021"
 description = "Quickly inspect type definitions from Rust dependency source code"
 repository = "https://github.com/tzneal/rspeek"
+license = "MIT"
+publish = false
 
 [dependencies]
 cargo_metadata = "0.23"
