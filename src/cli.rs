@@ -49,7 +49,11 @@ pub const LLM_HELP: &str = "\
 
 ## Usage
 
-rspeek is designed to be called by LLMs to look up structs, enums, unions,
+rspeek is a Rust-only tool. It parses Rust source files (.rs) and only
+works with Cargo (Rust) projects. Do NOT use it for Go, Python, Java,
+TypeScript, C++, or any other language.
+
+It is designed to be called by LLMs to look up structs, enums, unions,
 traits, type aliases, constants, statics, and functions from Rust crates
 without building docs.
 
