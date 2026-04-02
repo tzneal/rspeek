@@ -27,16 +27,42 @@ pub struct ImplBlock {
     pub end_line: usize,
 }
 
+/// Options threaded through the recursive collect/index/walk functions.
+#[derive(Clone, Copy)]
+struct CollectOpts<'a> {
+    name_filter: Option<&'a str>,
+    pub_only: bool,
+    out_dir: Option<&'a Path>,
+    text_filter: Option<&'a str>,
+}
+
 /// Build an index of items under `dirs` matching `item_name`.
+/// Uses a fast text pre-filter: only parses files containing `item_name`.
+/// Falls back to full parse if the fast pass finds nothing.
 pub fn index_crate(
     dirs: &[PathBuf],
     item_name: &str,
     pub_only: bool,
     out_dir: Option<&Path>,
 ) -> Result<Vec<IndexEntry>> {
+    let opts = CollectOpts {
+        name_filter: Some(item_name),
+        pub_only,
+        out_dir,
+        text_filter: Some(item_name),
+    };
     let mut entries = Vec::new();
     for dir in dirs {
-        entries.extend(collect(dir, Some(item_name), pub_only, out_dir)?);
+        entries.extend(collect(dir, opts)?);
+    }
+    if entries.is_empty() {
+        let opts = CollectOpts {
+            text_filter: None,
+            ..opts
+        };
+        for dir in dirs {
+            entries.extend(collect(dir, opts)?);
+        }
     }
     Ok(entries)
 }
@@ -47,9 +73,15 @@ pub fn list_items(
     pub_only: bool,
     out_dir: Option<&Path>,
 ) -> Result<Vec<IndexEntry>> {
+    let opts = CollectOpts {
+        name_filter: None,
+        pub_only,
+        out_dir,
+        text_filter: None,
+    };
     let mut entries = Vec::new();
     for dir in dirs {
-        entries.extend(collect(dir, None, pub_only, out_dir)?);
+        entries.extend(collect(dir, opts)?);
     }
     Ok(entries)
 }
@@ -76,6 +108,9 @@ pub fn find_impls(
 fn find_impls_in_file(path: &Path, type_name: &str) -> Result<Vec<ImplBlock>> {
     let source =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if !source.contains(type_name) {
+        return Ok(vec![]);
+    }
     let Ok(file) = syn::parse_file(&source) else {
         return Ok(vec![]);
     };
@@ -114,12 +149,7 @@ fn impl_is_for(imp: &syn::ItemImpl, type_name: &str) -> bool {
     }
 }
 
-fn collect(
-    src_dir: &Path,
-    name_filter: Option<&str>,
-    pub_only: bool,
-    out_dir: Option<&Path>,
-) -> Result<Vec<IndexEntry>> {
+fn collect(src_dir: &Path, opts: CollectOpts) -> Result<Vec<IndexEntry>> {
     let mut entries = Vec::new();
     let mut reexports = Vec::new();
     let mut visited = HashSet::new();
@@ -131,30 +161,13 @@ fn collect(
     } else if main_rs.exists() {
         main_rs
     } else {
-        walk_all_rs(
-            src_dir,
-            name_filter,
-            pub_only,
-            out_dir,
-            &mut entries,
-            &mut reexports,
-            &mut visited,
-        )?;
-        resolve_reexports(&mut entries, &reexports, name_filter);
+        walk_all_rs(src_dir, opts, &mut entries, &mut reexports, &mut visited)?;
+        resolve_reexports(&mut entries, &reexports, opts.name_filter);
         return Ok(entries);
     };
 
-    index_file(
-        &entry,
-        "",
-        name_filter,
-        pub_only,
-        out_dir,
-        &mut entries,
-        &mut reexports,
-        &mut visited,
-    )?;
-    resolve_reexports(&mut entries, &reexports, name_filter);
+    index_file(&entry, "", opts, &mut entries, &mut reexports, &mut visited)?;
+    resolve_reexports(&mut entries, &reexports, opts.name_filter);
     Ok(entries)
 }
 
@@ -221,13 +234,10 @@ fn reexport_path_matches(entry_module_path: &str, source_segments: &[String]) ->
     entry_module_path == expected || entry_module_path.ends_with(&format!("::{expected}"))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn index_file(
     path: &Path,
     module_path: &str,
-    name_filter: Option<&str>,
-    pub_only: bool,
-    out_dir: Option<&Path>,
+    opts: CollectOpts,
     entries: &mut Vec<IndexEntry>,
     reexports: &mut Vec<ReExport>,
     visited: &mut HashSet<PathBuf>,
@@ -239,17 +249,59 @@ fn index_file(
 
     let source =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+
+    // When text_filter is set and the file doesn't contain the text,
+    // skip the expensive parse+visit but still follow mod declarations
+    // by scanning for `mod <name>;` lines.
+    if opts.text_filter.is_some_and(|tf| !source.contains(tf)) {
+        let parent_dir = path.parent().unwrap();
+        for line in source.lines() {
+            let trimmed = line.trim();
+            let rest = trimmed
+                .strip_prefix("pub")
+                .and_then(|s| {
+                    if s.starts_with(' ') {
+                        Some(s.trim_start())
+                    } else if s.starts_with('(') {
+                        s.find(')').map(|i| s[i + 1..].trim_start())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(trimmed);
+            let Some(rest) = rest.strip_prefix("mod ") else {
+                continue;
+            };
+            let Some(mod_name) = rest.strip_suffix(';') else {
+                continue;
+            };
+            let mod_name = mod_name.trim();
+            if mod_name.is_empty() || mod_name.contains(' ') {
+                continue;
+            }
+            if let Some(child) = resolve_mod_file(parent_dir, mod_name) {
+                let child_mod = if module_path.is_empty() {
+                    mod_name.to_string()
+                } else {
+                    format!("{module_path}::{mod_name}")
+                };
+                index_file(&child, &child_mod, opts, entries, reexports, visited)?;
+            }
+        }
+        return Ok(());
+    }
+
     let file = syn::parse_file(&source).ok();
     let Some(file) = file else {
         return Ok(());
     };
 
     let mut visitor = ItemVisitor {
-        name_filter,
-        pub_only,
+        name_filter: opts.name_filter,
+        pub_only: opts.pub_only,
         module_path: module_path.to_string(),
         file_path: path.to_path_buf(),
-        out_dir: out_dir.map(Path::to_path_buf),
+        out_dir: opts.out_dir.map(Path::to_path_buf),
         entries,
         included_files: Vec::new(),
     };
@@ -258,16 +310,7 @@ fn index_file(
 
     // Index any files discovered via include!() macros
     for (inc_path, inc_module) in included_files {
-        index_file(
-            &inc_path,
-            &inc_module,
-            name_filter,
-            pub_only,
-            out_dir,
-            entries,
-            reexports,
-            visited,
-        )?;
+        index_file(&inc_path, &inc_module, opts, entries, reexports, visited)?;
     }
 
     // Collect `pub use` re-exports and follow `mod` declarations
@@ -286,16 +329,7 @@ fn index_file(
                     } else {
                         format!("{module_path}::{mod_name}")
                     };
-                    index_file(
-                        &child,
-                        &child_mod,
-                        name_filter,
-                        pub_only,
-                        out_dir,
-                        entries,
-                        reexports,
-                        visited,
-                    )?;
+                    index_file(&child, &child_mod, opts, entries, reexports, visited)?;
                 }
             }
             _ => {}
@@ -387,9 +421,7 @@ fn gather_rs_files_walk(dir: &Path, files: &mut Vec<PathBuf>) {
 
 fn walk_all_rs(
     dir: &Path,
-    name_filter: Option<&str>,
-    pub_only: bool,
-    out_dir: Option<&Path>,
+    opts: CollectOpts,
     entries: &mut Vec<IndexEntry>,
     reexports: &mut Vec<ReExport>,
     visited: &mut HashSet<PathBuf>,
@@ -398,26 +430,9 @@ fn walk_all_rs(
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            walk_all_rs(
-                &path,
-                name_filter,
-                pub_only,
-                out_dir,
-                entries,
-                reexports,
-                visited,
-            )?;
+            walk_all_rs(&path, opts, entries, reexports, visited)?;
         } else if path.extension().is_some_and(|e| e == "rs") {
-            index_file(
-                &path,
-                "",
-                name_filter,
-                pub_only,
-                out_dir,
-                entries,
-                reexports,
-                visited,
-            )?;
+            index_file(&path, "", opts, entries, reexports, visited)?;
         }
     }
     Ok(())
@@ -665,7 +680,16 @@ mod tests {
         let lib_rs = dir.path().join("lib.rs");
         let mut f = fs::File::create(&lib_rs).unwrap();
         f.write_all(source.as_bytes()).unwrap();
-        collect(dir.path(), None, false, None).unwrap()
+        collect(
+            dir.path(),
+            CollectOpts {
+                name_filter: None,
+                pub_only: false,
+                out_dir: None,
+                text_filter: None,
+            },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -710,6 +734,26 @@ mod tests {
     }
 
     #[test]
+    fn text_filter_follows_pub_crate_mod() {
+        // Foo exists in both `a.rs` (via `pub mod a`) and `b.rs` (via
+        // `pub(crate) mod b`). The fast path finds the first Foo so the
+        // fallback never triggers — if the text scanner can't follow
+        // `pub(crate) mod`, the second Foo is silently lost.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("lib.rs"), "pub mod a;\npub(crate) mod b;").unwrap();
+        fs::write(src.join("a.rs"), "pub struct Foo;").unwrap();
+        fs::write(src.join("b.rs"), "pub struct Foo;").unwrap();
+        let entries = index_crate(&[src], "Foo", false, None).unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "expected Foo from both modules, got: {entries:?}"
+        );
+    }
+
+    #[test]
     fn pub_only_filters_private_const() {
         let dir = tempfile::tempdir().unwrap();
         let lib_rs = dir.path().join("lib.rs");
@@ -718,7 +762,16 @@ mod tests {
             "const PRIVATE: u32 = 1;\npub const PUBLIC: u32 = 2;",
         )
         .unwrap();
-        let entries = collect(dir.path(), None, true, None).unwrap();
+        let entries = collect(
+            dir.path(),
+            CollectOpts {
+                name_filter: None,
+                pub_only: true,
+                out_dir: None,
+                text_filter: None,
+            },
+        )
+        .unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "PUBLIC");
     }
