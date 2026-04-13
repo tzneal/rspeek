@@ -86,6 +86,71 @@ pub fn list_items(
     Ok(entries)
 }
 
+/// Collect `pub use <crate_name>` re-exports from a crate's root source file.
+/// Returns `(original_crate_name, optional_alias)` pairs for re-exports that
+/// refer to external crates (not `crate::`, `self::`, or `super::` paths).
+pub fn cross_crate_reexports(
+    src_dir: &Path,
+    _out_dir: Option<&Path>,
+) -> Vec<(String, Option<String>)> {
+    let lib_rs = src_dir.join("lib.rs");
+    let path = if lib_rs.exists() {
+        lib_rs
+    } else {
+        return Vec::new();
+    };
+    let Ok(source) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(file) = syn::parse_file(&source) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for item in &file.items {
+        if let syn::Item::Use(u) = item {
+            if !is_pub(&u.vis) {
+                continue;
+            }
+            collect_extern_reexports(&u.tree, &mut result);
+        }
+    }
+    result
+}
+
+/// Extract bare external crate re-exports from a use tree.
+/// `pub use ttrpc;` → ("ttrpc", None)
+/// `pub use other as aliased;` → ("other", Some("aliased"))
+/// Skips paths starting with `crate`, `self`, `super`.
+fn collect_extern_reexports(tree: &syn::UseTree, out: &mut Vec<(String, Option<String>)>) {
+    match tree {
+        syn::UseTree::Name(n) => {
+            let name = n.ident.to_string();
+            if !is_internal_path(&name) {
+                out.push((name, None));
+            }
+        }
+        syn::UseTree::Rename(r) => {
+            let name = r.ident.to_string();
+            if !is_internal_path(&name) {
+                out.push((name, Some(r.rename.to_string())));
+            }
+        }
+        syn::UseTree::Path(_) => {
+            // `pub use ttrpc::context::with_timeout;` — not a bare crate re-export, skip
+        }
+        syn::UseTree::Group(g) => {
+            for tree in &g.items {
+                collect_extern_reexports(tree, out);
+            }
+        }
+        syn::UseTree::Glob(_) => {}
+    }
+}
+
+fn is_internal_path(name: &str) -> bool {
+    matches!(name, "crate" | "self" | "super")
+}
+
 /// Find all `impl` blocks for `type_name` under `dirs`.
 pub fn find_impls(
     dirs: &[PathBuf],
@@ -774,5 +839,41 @@ mod tests {
         .unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "PUBLIC");
+    }
+
+    #[test]
+    fn cross_crate_reexports_finds_pub_use_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib_rs = dir.path().join("lib.rs");
+        fs::write(
+            &lib_rs,
+            "pub use ttrpc;\npub use other_crate as aliased;\npub struct Local;",
+        )
+        .unwrap();
+        let reexports = cross_crate_reexports(dir.path(), None);
+        assert_eq!(reexports.len(), 2);
+        assert!(reexports
+            .iter()
+            .any(|(name, alias)| name == "ttrpc" && alias.is_none()));
+        assert!(reexports
+            .iter()
+            .any(|(name, alias)| name == "other_crate" && alias.as_deref() == Some("aliased")));
+    }
+
+    #[test]
+    fn cross_crate_reexports_ignores_internal_reexports() {
+        // `pub use crate::foo::Bar;` and `pub use self::baz;` are internal, not cross-crate
+        let dir = tempfile::tempdir().unwrap();
+        let lib_rs = dir.path().join("lib.rs");
+        fs::write(
+            &lib_rs,
+            "pub use crate::foo::Bar;\npub use self::baz;\nmod foo { pub struct Bar; }",
+        )
+        .unwrap();
+        let reexports = cross_crate_reexports(dir.path(), None);
+        assert!(
+            reexports.is_empty(),
+            "internal re-exports should not appear: {reexports:?}"
+        );
     }
 }
