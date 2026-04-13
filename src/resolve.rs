@@ -18,7 +18,7 @@ pub struct ResolvedCrate {
 }
 
 /// Normalize crate name for comparison (treat `-` and `_` as equivalent).
-fn normalize(name: &str) -> String {
+pub fn normalize(name: &str) -> String {
     name.replace('-', "_")
 }
 

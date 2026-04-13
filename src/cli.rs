@@ -135,8 +135,8 @@ error message (plain text) or in the \"suggestions\" array (JSON).
 - Only finds items defined as regular Rust syntax (struct, enum, union, trait, type, fn, const, static)
 - Macro bodies are parsed for item definitions (e.g. syn's ast_struct!), but
   procedural macros and complex macro_rules! patterns are not expanded
-- Re-exports: `pub use` within a crate are followed; glob re-exports and
-  cross-crate re-exports are not
+- Re-exports: `pub use` within a crate are followed; cross-crate `pub use <crate>`
+  re-exports are followed for qualified lookups; glob re-exports are not
 ";
 
 fn not_found(message: impl Into<String>, query: &str, candidates: &[String]) -> NotFound {
@@ -329,6 +329,46 @@ fn dedup_versions(
     (deduped, other_versions)
 }
 
+/// Check if a qualified query's first module segment matches a `pub use <crate>`
+/// re-export in any of the search crates, and if so, build a redirected query
+/// targeting that crate with the remaining path segments.
+fn cross_crate_redirect(
+    query: &query::Query,
+    search_crates: &[&ResolvedCrate],
+    ws: &resolve::Workspace,
+) -> Option<query::Query> {
+    let query::Query::Qualified {
+        module_segments,
+        item,
+        ..
+    } = query
+    else {
+        return None;
+    };
+    let first_seg = module_segments.first()?;
+    for c in search_crates {
+        let Some(src_dir) = c.source_dirs.first() else {
+            continue;
+        };
+        let reexports = index::cross_crate_reexports(src_dir, c.out_dir.as_deref());
+        for (crate_name, alias) in &reexports {
+            let visible = alias.as_deref().unwrap_or(crate_name);
+            if resolve::normalize(visible) != resolve::normalize(first_seg) {
+                continue;
+            }
+            if ws.filter(crate_name).is_empty() {
+                continue;
+            }
+            return Some(query::Query::Qualified {
+                crate_name: crate_name.clone(),
+                module_segments: module_segments[1..].to_vec(),
+                item: item.clone(),
+            });
+        }
+    }
+    None
+}
+
 fn run_item_search(
     cli: &Cli,
     ws: &resolve::Workspace,
@@ -402,6 +442,14 @@ fn run_item_search(
     let (matches, other_versions) = dedup_versions(matches);
 
     if matches.is_empty() {
+        // Cross-crate re-export fallback: if this is a qualified query like
+        // `wrapper::ttrpc::context::with_timeout`, check if the first module
+        // segment matches a `pub use <crate>` in the target crate and retry
+        // the search in that crate with the remaining path.
+        if let Some(redirected) = cross_crate_redirect(query, &search_crates, ws) {
+            return run_item_search(cli, ws, &redirected, out);
+        }
+
         let all_names: Vec<String> = search_crates
             .iter()
             .flat_map(|c| {
@@ -507,4 +555,184 @@ fn run_item_search(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Simulate the cross-crate re-export scenario:
+    /// - "wrapper" crate has `pub use inner_crate;`
+    /// - "inner_crate" crate has `pub fn target_fn() {}`  in module `ctx`
+    /// - Query: `wrapper::inner_crate::ctx::target_fn` should find the fn
+    #[test]
+    fn qualified_lookup_follows_cross_crate_reexport() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create "inner_crate" source
+        let inner_src = dir.path().join("inner_crate_src");
+        fs::create_dir_all(&inner_src).unwrap();
+        fs::write(inner_src.join("lib.rs"), "pub mod ctx;").unwrap();
+        fs::write(inner_src.join("ctx.rs"), "pub fn target_fn() {}").unwrap();
+
+        // Create "wrapper" crate source with `pub use inner_crate;`
+        let wrapper_src = dir.path().join("wrapper_src");
+        fs::create_dir_all(&wrapper_src).unwrap();
+        fs::write(wrapper_src.join("lib.rs"), "pub use inner_crate;").unwrap();
+
+        let ws = resolve::Workspace {
+            crates: vec![
+                resolve::ResolvedCrate {
+                    name: "wrapper".to_string(),
+                    version: "0.1.0".to_string(),
+                    source_dirs: vec![wrapper_src],
+                    is_workspace_member: false,
+                    out_dir: None,
+                    deps: vec!["inner_crate".to_string()],
+                },
+                resolve::ResolvedCrate {
+                    name: "inner_crate".to_string(),
+                    version: "0.1.0".to_string(),
+                    source_dirs: vec![inner_src],
+                    is_workspace_member: false,
+                    out_dir: None,
+                    deps: vec![],
+                },
+            ],
+        };
+
+        let query = query::Query::Qualified {
+            crate_name: "wrapper".to_string(),
+            module_segments: vec!["inner_crate".to_string(), "ctx".to_string()],
+            item: "target_fn".to_string(),
+        };
+
+        let cli = Cli::parse_from(["rspeek", "wrapper::inner_crate::ctx::target_fn"]);
+        let mut out = Output::default();
+        let result = run_item_search(&cli, &ws, &query, &mut out);
+        assert!(
+            result.is_ok(),
+            "expected match via cross-crate re-export, got: {:?}",
+            result.err().map(|e| e.message)
+        );
+        assert!(
+            out.stdout.contains("target_fn"),
+            "output should contain target_fn: {}",
+            out.stdout
+        );
+    }
+
+    /// When the re-exported crate name uses hyphens but the `pub use` uses underscores,
+    /// the lookup should still work (crate names normalize `-` to `_`).
+    #[test]
+    fn cross_crate_reexport_normalizes_hyphens() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let inner_src = dir.path().join("inner_src");
+        fs::create_dir_all(&inner_src).unwrap();
+        fs::write(inner_src.join("lib.rs"), "pub fn my_func() {}").unwrap();
+
+        let wrapper_src = dir.path().join("wrapper_src");
+        fs::create_dir_all(&wrapper_src).unwrap();
+        // `pub use my_crate;` — the actual crate is named "my-crate" with a hyphen
+        fs::write(wrapper_src.join("lib.rs"), "pub use my_crate;").unwrap();
+
+        let ws = resolve::Workspace {
+            crates: vec![
+                resolve::ResolvedCrate {
+                    name: "wrapper".to_string(),
+                    version: "0.1.0".to_string(),
+                    source_dirs: vec![wrapper_src],
+                    is_workspace_member: false,
+                    out_dir: None,
+                    deps: vec!["my-crate".to_string()],
+                },
+                resolve::ResolvedCrate {
+                    name: "my-crate".to_string(),
+                    version: "0.1.0".to_string(),
+                    source_dirs: vec![inner_src],
+                    is_workspace_member: false,
+                    out_dir: None,
+                    deps: vec![],
+                },
+            ],
+        };
+
+        let query = query::Query::Qualified {
+            crate_name: "wrapper".to_string(),
+            module_segments: vec!["my_crate".to_string()],
+            item: "my_func".to_string(),
+        };
+
+        let cli = Cli::parse_from(["rspeek", "wrapper::my_crate::my_func"]);
+        let mut out = Output::default();
+        let result = run_item_search(&cli, &ws, &query, &mut out);
+        assert!(
+            result.is_ok(),
+            "expected match via cross-crate re-export with hyphen normalization, got: {:?}",
+            result.err().map(|e| e.message)
+        );
+        assert!(
+            out.stdout.contains("my_func"),
+            "output should contain my_func: {}",
+            out.stdout
+        );
+    }
+
+    /// `pub use real_crate as aliased;` — querying via the alias name should redirect
+    /// to the real crate.
+    #[test]
+    fn cross_crate_reexport_follows_alias() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let inner_src = dir.path().join("inner_src");
+        fs::create_dir_all(&inner_src).unwrap();
+        fs::write(inner_src.join("lib.rs"), "pub fn aliased_fn() {}").unwrap();
+
+        let wrapper_src = dir.path().join("wrapper_src");
+        fs::create_dir_all(&wrapper_src).unwrap();
+        fs::write(wrapper_src.join("lib.rs"), "pub use real_crate as nice;").unwrap();
+
+        let ws = resolve::Workspace {
+            crates: vec![
+                resolve::ResolvedCrate {
+                    name: "wrapper".to_string(),
+                    version: "0.1.0".to_string(),
+                    source_dirs: vec![wrapper_src],
+                    is_workspace_member: false,
+                    out_dir: None,
+                    deps: vec!["real_crate".to_string()],
+                },
+                resolve::ResolvedCrate {
+                    name: "real_crate".to_string(),
+                    version: "0.1.0".to_string(),
+                    source_dirs: vec![inner_src],
+                    is_workspace_member: false,
+                    out_dir: None,
+                    deps: vec![],
+                },
+            ],
+        };
+
+        let query = query::Query::Qualified {
+            crate_name: "wrapper".to_string(),
+            module_segments: vec!["nice".to_string()],
+            item: "aliased_fn".to_string(),
+        };
+
+        let cli = Cli::parse_from(["rspeek", "wrapper::nice::aliased_fn"]);
+        let mut out = Output::default();
+        let result = run_item_search(&cli, &ws, &query, &mut out);
+        assert!(
+            result.is_ok(),
+            "expected match via aliased re-export, got: {:?}",
+            result.err().map(|e| e.message)
+        );
+        assert!(
+            out.stdout.contains("aliased_fn"),
+            "output should contain aliased_fn: {}",
+            out.stdout
+        );
+    }
 }
