@@ -16,6 +16,8 @@ pub struct JsonEntry {
     pub crate_name: String,
     pub crate_version: String,
     pub source: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cfg: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub impls: Option<Vec<JsonImplBlock>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -286,6 +288,7 @@ pub fn to_json_entry(
         crate_name: krate.name.clone(),
         crate_version: krate.version.clone(),
         source,
+        cfg: entry.cfg.clone(),
         impls: impls.map(|i| to_json_impls(i, signature)).transpose()?,
         other_versions,
     })
@@ -316,6 +319,17 @@ pub fn format_entry(
         krate.name,
         krate.version,
     );
+    if !entry.cfg.is_empty() {
+        out.push_str(&format!(
+            "**Cfg:** {}\n",
+            entry
+                .cfg
+                .iter()
+                .map(|c| format!("`#[cfg({c})]`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     if !other_versions.is_empty() {
         out.push_str(&format!(
             "**Also in:** {}\n",

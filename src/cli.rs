@@ -541,7 +541,7 @@ fn run_item_search(
                 )
             };
             out.println(&format!(
-                "- {} `{}{}::{}` v{} at {}:{}{}",
+                "- {} `{}{}::{}` v{} at {}:{}{}{}",
                 entry.kind,
                 c.name,
                 mod_display,
@@ -550,6 +550,11 @@ fn run_item_search(
                 entry.file.display(),
                 entry.start_line,
                 ver_note,
+                if entry.cfg.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [cfg: {}]", entry.cfg.join(", "))
+                },
             ));
         }
     }

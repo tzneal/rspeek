@@ -16,6 +16,10 @@ pub struct IndexEntry {
     pub file: PathBuf,
     pub start_line: usize,
     pub end_line: usize,
+    /// Cfg predicates that gate this item (from `#[cfg(...)]` on the item
+    /// itself, its parent modules, and cfg-gating macros). Empty when ungated.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cfg: Vec<String>,
 }
 
 /// An `impl` block for a type.
@@ -28,12 +32,16 @@ pub struct ImplBlock {
 }
 
 /// Options threaded through the recursive collect/index/walk functions.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CollectOpts<'a> {
     name_filter: Option<&'a str>,
     pub_only: bool,
     out_dir: Option<&'a Path>,
     text_filter: Option<&'a str>,
+    /// Cfg predicates inherited from parent modules/macros.
+    inherited_cfg: Vec<String>,
+    /// Cfg predicates extracted from `macro_rules!` definitions across the crate.
+    macro_cfgs: MacroCfgMap,
 }
 
 /// Build an index of items under `dirs` matching `item_name`.
@@ -45,15 +53,18 @@ pub fn index_crate(
     pub_only: bool,
     out_dir: Option<&Path>,
 ) -> Result<Vec<IndexEntry>> {
+    let macro_cfgs = prescan_macro_cfgs(dirs);
     let opts = CollectOpts {
         name_filter: Some(item_name),
         pub_only,
         out_dir,
         text_filter: Some(item_name),
+        inherited_cfg: Vec::new(),
+        macro_cfgs: macro_cfgs.clone(),
     };
     let mut entries = Vec::new();
     for dir in dirs {
-        entries.extend(collect(dir, opts)?);
+        entries.extend(collect(dir, opts.clone())?);
     }
     if entries.is_empty() {
         let opts = CollectOpts {
@@ -61,7 +72,7 @@ pub fn index_crate(
             ..opts
         };
         for dir in dirs {
-            entries.extend(collect(dir, opts)?);
+            entries.extend(collect(dir, opts.clone())?);
         }
     }
     Ok(entries)
@@ -73,15 +84,18 @@ pub fn list_items(
     pub_only: bool,
     out_dir: Option<&Path>,
 ) -> Result<Vec<IndexEntry>> {
+    let macro_cfgs = prescan_macro_cfgs(dirs);
     let opts = CollectOpts {
         name_filter: None,
         pub_only,
         out_dir,
         text_filter: None,
+        inherited_cfg: Vec::new(),
+        macro_cfgs,
     };
     let mut entries = Vec::new();
     for dir in dirs {
-        entries.extend(collect(dir, opts)?);
+        entries.extend(collect(dir, opts.clone())?);
     }
     Ok(entries)
 }
@@ -226,12 +240,19 @@ fn collect(src_dir: &Path, opts: CollectOpts) -> Result<Vec<IndexEntry>> {
     } else if main_rs.exists() {
         main_rs
     } else {
-        walk_all_rs(src_dir, opts, &mut entries, &mut reexports, &mut visited)?;
+        walk_all_rs(src_dir, &opts, &mut entries, &mut reexports, &mut visited)?;
         resolve_reexports(&mut entries, &reexports, opts.name_filter);
         return Ok(entries);
     };
 
-    index_file(&entry, "", opts, &mut entries, &mut reexports, &mut visited)?;
+    index_file(
+        &entry,
+        "",
+        &opts,
+        &mut entries,
+        &mut reexports,
+        &mut visited,
+    )?;
     resolve_reexports(&mut entries, &reexports, opts.name_filter);
     Ok(entries)
 }
@@ -281,6 +302,7 @@ fn resolve_reexports(
                     file: orig.file.clone(),
                     start_line: orig.start_line,
                     end_line: orig.end_line,
+                    cfg: orig.cfg.clone(),
                 });
             }
         }
@@ -302,7 +324,7 @@ fn reexport_path_matches(entry_module_path: &str, source_segments: &[String]) ->
 fn index_file(
     path: &Path,
     module_path: &str,
-    opts: CollectOpts,
+    opts: &CollectOpts,
     entries: &mut Vec<IndexEntry>,
     reexports: &mut Vec<ReExport>,
     visited: &mut HashSet<PathBuf>,
@@ -361,43 +383,66 @@ fn index_file(
         return Ok(());
     };
 
+    // Collect macro_rules! cfg definitions from this file and merge with crate-wide ones.
+    let mut macro_cfgs = opts.macro_cfgs.clone();
+    macro_cfgs.extend(collect_macro_cfg_defs(&file));
+
+    let parent_dir = path.parent().unwrap();
     let mut visitor = ItemVisitor {
         name_filter: opts.name_filter,
         pub_only: opts.pub_only,
         module_path: module_path.to_string(),
         file_path: path.to_path_buf(),
         out_dir: opts.out_dir.map(Path::to_path_buf),
+        inherited_cfg: opts.inherited_cfg.clone(),
+        macro_cfgs: &macro_cfgs,
+        parent_dir,
         entries,
         included_files: Vec::new(),
+        child_mods: Vec::new(),
     };
     visitor.visit_file(&file);
     let included_files = std::mem::take(&mut visitor.included_files);
+    let child_mods = std::mem::take(&mut visitor.child_mods);
 
     // Index any files discovered via include!() macros
-    for (inc_path, inc_module) in included_files {
-        index_file(&inc_path, &inc_module, opts, entries, reexports, visited)?;
+    for (inc_path, inc_module, inc_cfg) in included_files {
+        let child_opts = CollectOpts {
+            inherited_cfg: inc_cfg,
+            ..opts.clone()
+        };
+        index_file(
+            &inc_path,
+            &inc_module,
+            &child_opts,
+            entries,
+            reexports,
+            visited,
+        )?;
     }
 
-    // Collect `pub use` re-exports and follow `mod` declarations
-    let parent_dir = path.parent().unwrap();
+    // Follow mod declarations and macro-body mod declarations
+    for (child_path, child_mod, child_cfg) in child_mods {
+        let child_opts = CollectOpts {
+            inherited_cfg: child_cfg,
+            ..opts.clone()
+        };
+        index_file(
+            &child_path,
+            &child_mod,
+            &child_opts,
+            entries,
+            reexports,
+            visited,
+        )?;
+    }
+
+    // Collect `pub use` re-exports
     for item in &file.items {
-        match item {
-            syn::Item::Use(u) if is_pub(&u.vis) => {
+        if let syn::Item::Use(u) = item {
+            if is_pub(&u.vis) {
                 collect_reexports(&u.tree, &[], module_path, reexports);
             }
-            syn::Item::Mod(m) if m.content.is_none() => {
-                let mod_name = m.ident.to_string();
-                let child_path = resolve_mod_file(parent_dir, &mod_name);
-                if let Some(child) = child_path {
-                    let child_mod = if module_path.is_empty() {
-                        mod_name
-                    } else {
-                        format!("{module_path}::{mod_name}")
-                    };
-                    index_file(&child, &child_mod, opts, entries, reexports, visited)?;
-                }
-            }
-            _ => {}
         }
     }
 
@@ -486,7 +531,7 @@ fn gather_rs_files_walk(dir: &Path, files: &mut Vec<PathBuf>) {
 
 fn walk_all_rs(
     dir: &Path,
-    opts: CollectOpts,
+    opts: &CollectOpts,
     entries: &mut Vec<IndexEntry>,
     reexports: &mut Vec<ReExport>,
     visited: &mut HashSet<PathBuf>,
@@ -503,19 +548,59 @@ fn walk_all_rs(
     Ok(())
 }
 
+/// Mapping from macro name → cfg predicates extracted from `macro_rules!` definitions.
+type MacroCfgMap = std::collections::HashMap<String, Vec<String>>;
+
+/// Pre-scan all `.rs` files under `dirs` for `macro_rules!` cfg-gating definitions.
+fn prescan_macro_cfgs(dirs: &[PathBuf]) -> MacroCfgMap {
+    let mut map = MacroCfgMap::new();
+    for dir in dirs {
+        for path in gather_rs_files(dir) {
+            let Ok(source) = fs::read_to_string(&path) else {
+                continue;
+            };
+            // Quick text check: skip files that don't contain macro_rules
+            if !source.contains("macro_rules") {
+                continue;
+            }
+            let Ok(file) = syn::parse_file(&source) else {
+                continue;
+            };
+            map.extend(collect_macro_cfg_defs(&file));
+        }
+    }
+    map
+}
+
 struct ItemVisitor<'a> {
     name_filter: Option<&'a str>,
     pub_only: bool,
     module_path: String,
     file_path: PathBuf,
     out_dir: Option<PathBuf>,
+    /// Cfg predicates inherited from parent modules/macros.
+    inherited_cfg: Vec<String>,
+    /// Cfg predicates extracted from `macro_rules!` definitions in this file.
+    macro_cfgs: &'a MacroCfgMap,
+    /// Parent directory for resolving `mod foo;` declarations.
+    parent_dir: &'a Path,
     entries: &'a mut Vec<IndexEntry>,
     /// Files discovered via `include!()` that need indexing after the visit.
-    included_files: Vec<(PathBuf, String)>,
+    included_files: Vec<(PathBuf, String, Vec<String>)>,
+    /// Child mod files discovered (path, module_path, cfg) to index after visit.
+    child_mods: Vec<(PathBuf, String, Vec<String>)>,
 }
 
 impl ItemVisitor<'_> {
-    fn check(&mut self, name: &str, kind: &'static str, is_pub: bool, start: usize, end: usize) {
+    fn check(
+        &mut self,
+        name: &str,
+        kind: &'static str,
+        is_pub: bool,
+        attrs: &[syn::Attribute],
+        start: usize,
+        end: usize,
+    ) {
         if self.pub_only && !is_pub {
             return;
         }
@@ -524,6 +609,9 @@ impl ItemVisitor<'_> {
                 return;
             }
         }
+        let mut cfg = self.inherited_cfg.clone();
+        cfg.extend(extract_cfg_attrs(attrs));
+        cfg.dedup();
         self.entries.push(IndexEntry {
             name: name.to_string(),
             kind,
@@ -531,12 +619,91 @@ impl ItemVisitor<'_> {
             file: self.file_path.clone(),
             start_line: start,
             end_line: end,
+            cfg,
         });
     }
 }
 
 fn is_pub(vis: &syn::Visibility) -> bool {
     matches!(vis, syn::Visibility::Public(_))
+}
+
+/// Extract `#[cfg(...)]` predicate strings from a list of attributes.
+fn extract_cfg_attrs(attrs: &[syn::Attribute]) -> Vec<String> {
+    let mut cfgs = Vec::new();
+    for attr in attrs {
+        if !attr.path().is_ident("cfg") {
+            continue;
+        }
+        if let syn::Meta::List(list) = &attr.meta {
+            cfgs.push(list.tokens.to_string());
+        }
+    }
+    cfgs
+}
+
+/// Scan a file for `macro_rules!` definitions that follow the cfg-gating pattern:
+/// ```ignore
+/// macro_rules! cfg_xxx {
+///     ($($item:item)*) => { $( #[cfg(PRED)] $item )* }
+/// }
+/// ```
+/// Returns a map from macro name → vec of cfg predicate strings.
+fn collect_macro_cfg_defs(file: &syn::File) -> MacroCfgMap {
+    let mut map = MacroCfgMap::new();
+    for item in &file.items {
+        let syn::Item::Macro(m) = item else { continue };
+        let Some(ident) = &m.ident else { continue };
+        if !m.mac.path.is_ident("macro_rules") {
+            continue;
+        }
+        let name = ident.to_string();
+        if let Some(cfgs) = extract_cfg_from_macro_body(&m.mac.tokens) {
+            if !cfgs.is_empty() {
+                map.insert(name, cfgs);
+            }
+        }
+    }
+    map
+}
+
+/// Try to extract cfg predicates from a macro_rules! body.
+/// Looks for `#[cfg(...)]` attributes before `$item` in the expansion.
+fn extract_cfg_from_macro_body(tokens: &proc_macro2::TokenStream) -> Option<Vec<String>> {
+    // proc_macro2 to_string() adds spaces between all tokens.
+    // Strip whitespace for reliable matching, then normalize output.
+    let s = tokens.to_string();
+    let compact: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    let after_arrow = compact.split("=>").nth(1)?;
+    let mut cfgs = Vec::new();
+    let mut rest = after_arrow;
+    while let Some(pos) = rest.find("#[cfg(") {
+        let start = pos + 6;
+        let substr = &rest[start..];
+        let mut depth = 1i32;
+        let mut end = 0;
+        for (i, ch) in substr.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if end > 0 {
+            // Normalize: add space after commas and around = for readability
+            let raw = &substr[..end];
+            let pred = raw.replace(',', ", ").replace('=', " = ");
+            cfgs.push(pred);
+        }
+        rest = &rest[start + end..];
+    }
+    Some(cfgs)
 }
 
 /// Resolve the path argument of an `include!()` macro invocation.
@@ -601,6 +768,7 @@ impl<'ast> Visit<'ast> for ItemVisitor<'_> {
             &node.ident.to_string(),
             "struct",
             is_pub(&node.vis),
+            &node.attrs,
             start,
             node.span().end().line,
         );
@@ -613,6 +781,7 @@ impl<'ast> Visit<'ast> for ItemVisitor<'_> {
             &node.ident.to_string(),
             "enum",
             is_pub(&node.vis),
+            &node.attrs,
             start,
             node.span().end().line,
         );
@@ -625,6 +794,7 @@ impl<'ast> Visit<'ast> for ItemVisitor<'_> {
             &node.ident.to_string(),
             "trait",
             is_pub(&node.vis),
+            &node.attrs,
             start,
             node.span().end().line,
         );
@@ -637,6 +807,7 @@ impl<'ast> Visit<'ast> for ItemVisitor<'_> {
             &node.ident.to_string(),
             "type",
             is_pub(&node.vis),
+            &node.attrs,
             start,
             node.span().end().line,
         );
@@ -649,6 +820,7 @@ impl<'ast> Visit<'ast> for ItemVisitor<'_> {
             &node.ident.to_string(),
             "union",
             is_pub(&node.vis),
+            &node.attrs,
             start,
             node.span().end().line,
         );
@@ -661,6 +833,7 @@ impl<'ast> Visit<'ast> for ItemVisitor<'_> {
             &node.ident.to_string(),
             "const",
             is_pub(&node.vis),
+            &node.attrs,
             start,
             node.span().end().line,
         );
@@ -672,6 +845,7 @@ impl<'ast> Visit<'ast> for ItemVisitor<'_> {
             &node.ident.to_string(),
             "static",
             is_pub(&node.vis),
+            &node.attrs,
             start,
             node.span().end().line,
         );
@@ -683,15 +857,21 @@ impl<'ast> Visit<'ast> for ItemVisitor<'_> {
             &node.sig.ident.to_string(),
             "fn",
             is_pub(&node.vis),
+            &node.attrs,
             start,
             node.span().end().line,
         );
     }
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        let mod_name = node.ident.to_string();
+        let mut mod_cfg = self.inherited_cfg.clone();
+        mod_cfg.extend(extract_cfg_attrs(&node.attrs));
+
         if node.content.is_some() {
-            let mod_name = node.ident.to_string();
+            // Inline module — recurse with updated cfg context
             let old_path = self.module_path.clone();
+            let old_cfg = std::mem::replace(&mut self.inherited_cfg, mod_cfg);
             self.module_path = if old_path.is_empty() {
                 mod_name
             } else {
@@ -699,6 +879,17 @@ impl<'ast> Visit<'ast> for ItemVisitor<'_> {
             };
             syn::visit::visit_item_mod(self, node);
             self.module_path = old_path;
+            self.inherited_cfg = old_cfg;
+        } else {
+            // File-reference mod — queue for indexing with cfg context
+            let child_mod = if self.module_path.is_empty() {
+                mod_name.clone()
+            } else {
+                format!("{}::{mod_name}", self.module_path)
+            };
+            if let Some(child) = resolve_mod_file(self.parent_dir, &mod_name) {
+                self.child_mods.push((child, child_mod, mod_cfg));
+            }
         }
     }
 
@@ -707,7 +898,11 @@ impl<'ast> Visit<'ast> for ItemVisitor<'_> {
         if node.mac.path.is_ident("include") {
             if let Some(path) = resolve_include_path(&node.mac.tokens, self.out_dir.as_deref()) {
                 if path.exists() {
-                    self.included_files.push((path, self.module_path.clone()));
+                    self.included_files.push((
+                        path,
+                        self.module_path.clone(),
+                        self.inherited_cfg.clone(),
+                    ));
                     return;
                 }
             }
@@ -718,7 +913,11 @@ impl<'ast> Visit<'ast> for ItemVisitor<'_> {
                 if let Ok(lit) = syn::parse2::<syn::LitStr>(node.mac.tokens.clone()) {
                     let path = out_dir.join(format!("{}.rs", lit.value()));
                     if path.exists() {
-                        self.included_files.push((path, self.module_path.clone()));
+                        self.included_files.push((
+                            path,
+                            self.module_path.clone(),
+                            self.inherited_cfg.clone(),
+                        ));
                         return;
                     }
                 }
@@ -726,10 +925,37 @@ impl<'ast> Visit<'ast> for ItemVisitor<'_> {
         }
         // Try to parse the macro body as Rust items.
         // Handles patterns like: ast_struct! { pub struct Foo { ... } }
+        // Also handles cfg-gating macros like: cfg_net_unix! { mod foo; pub mod bar { ... } }
         let tokens = node.mac.tokens.clone();
         if let Ok(body) = syn::parse2::<syn::File>(tokens) {
+            // Check if this macro has known cfg predicates
+            let macro_name = node
+                .mac
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            let macro_cfg = self
+                .macro_cfgs
+                .get(&macro_name)
+                .cloned()
+                .unwrap_or_default();
+
+            let old_cfg = if !macro_cfg.is_empty() {
+                let mut combined = self.inherited_cfg.clone();
+                combined.extend(macro_cfg);
+                Some(std::mem::replace(&mut self.inherited_cfg, combined))
+            } else {
+                None
+            };
+
             for item in &body.items {
                 self.visit_item(item);
+            }
+
+            if let Some(prev) = old_cfg {
+                self.inherited_cfg = prev;
             }
         }
     }
@@ -752,6 +978,8 @@ mod tests {
                 pub_only: false,
                 out_dir: None,
                 text_filter: None,
+                inherited_cfg: Vec::new(),
+                macro_cfgs: MacroCfgMap::new(),
             },
         )
         .unwrap()
@@ -834,6 +1062,8 @@ mod tests {
                 pub_only: true,
                 out_dir: None,
                 text_filter: None,
+                inherited_cfg: Vec::new(),
+                macro_cfgs: MacroCfgMap::new(),
             },
         )
         .unwrap();
@@ -875,5 +1105,114 @@ mod tests {
             reexports.is_empty(),
             "internal re-exports should not appear: {reexports:?}"
         );
+    }
+
+    #[test]
+    fn cfg_attr_on_item() {
+        let entries = collect_from_source("#[cfg(unix)]\npub struct UnixOnly;");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cfg, vec!["unix"]);
+    }
+
+    #[test]
+    fn cfg_attr_inherited_from_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.rs");
+        fs::write(
+            &src,
+            "#[cfg(unix)]\nmod platform {\n    pub struct Inner;\n}",
+        )
+        .unwrap();
+        let entries = collect(
+            dir.path(),
+            CollectOpts {
+                name_filter: None,
+                pub_only: false,
+                out_dir: None,
+                text_filter: None,
+                inherited_cfg: Vec::new(),
+                macro_cfgs: MacroCfgMap::new(),
+            },
+        )
+        .unwrap();
+        let inner = entries.iter().find(|e| e.name == "Inner").unwrap();
+        assert_eq!(inner.cfg, vec!["unix"]);
+    }
+
+    #[test]
+    fn cfg_gating_macro_items_found() {
+        let source = r#"
+macro_rules! cfg_net_unix {
+    ($($item:item)*) => {
+        $(
+            #[cfg(all(unix, feature = "net"))]
+            $item
+        )*
+    }
+}
+
+cfg_net_unix! {
+    pub struct AsyncFd;
+}
+"#;
+        let entries = collect_from_source(source);
+        let entry = entries.iter().find(|e| e.name == "AsyncFd").unwrap();
+        assert_eq!(entry.cfg, vec![r#"all(unix, feature = "net")"#]);
+    }
+
+    #[test]
+    fn cfg_gating_macro_follows_mod_to_child_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lib.rs"),
+            r#"
+macro_rules! cfg_net_unix {
+    ($($item:item)*) => {
+        $(
+            #[cfg(all(unix, feature = "net"))]
+            $item
+        )*
+    }
+}
+
+cfg_net_unix! {
+    mod child;
+}
+"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("child.rs"), "pub struct ChildItem;").unwrap();
+        let entries = collect(
+            dir.path(),
+            CollectOpts {
+                name_filter: None,
+                pub_only: false,
+                out_dir: None,
+                text_filter: None,
+                inherited_cfg: Vec::new(),
+                macro_cfgs: MacroCfgMap::new(),
+            },
+        )
+        .unwrap();
+        let child = entries.iter().find(|e| e.name == "ChildItem").unwrap();
+        assert_eq!(child.module_path, "child");
+        assert_eq!(child.cfg, vec![r#"all(unix, feature = "net")"#]);
+    }
+
+    #[test]
+    fn no_cfg_when_ungated() {
+        let entries = collect_from_source("pub struct Plain;");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].cfg.is_empty());
+    }
+
+    #[test]
+    fn multiple_cfg_attrs_accumulated() {
+        let entries =
+            collect_from_source("#[cfg(unix)]\n#[cfg(feature = \"net\")]\npub struct Multi;");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cfg.len(), 2);
+        assert!(entries[0].cfg.contains(&"unix".to_string()));
+        assert!(entries[0].cfg.contains(&"feature = \"net\"".to_string()));
     }
 }
