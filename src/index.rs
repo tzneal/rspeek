@@ -339,11 +339,29 @@ fn index_file(
 
     // When text_filter is set and the file doesn't contain the text,
     // skip the expensive parse+visit but still follow mod declarations
-    // by scanning for `mod <name>;` lines.
+    // by scanning for `mod <name>;` lines. Honors a `#[path = "..."]`
+    // attribute on the preceding line (or one separated by other attrs
+    // like `#[cfg(...)]`), matching rustc's resolution rules.
     if opts.text_filter.is_some_and(|tf| !source.contains(tf)) {
-        let parent_dir = path.parent().unwrap();
+        let parent_dir = submodule_dir(path);
+        let mut pending_path: Option<String> = None;
         for line in source.lines() {
             let trimmed = line.trim();
+
+            // Buffer `#[path = "..."]` for use on the next mod line.
+            if let Some(p) = parse_path_attr_line(trimmed) {
+                pending_path = Some(p);
+                continue;
+            }
+            // Ignore other attributes / empty / comment lines between
+            // `#[path]` and the `mod` line.
+            if trimmed.is_empty()
+                || trimmed.starts_with("//")
+                || (trimmed.starts_with("#[") && trimmed.ends_with(']'))
+            {
+                continue;
+            }
+
             let rest = trimmed
                 .strip_prefix("pub")
                 .and_then(|s| {
@@ -357,16 +375,28 @@ fn index_file(
                 })
                 .unwrap_or(trimmed);
             let Some(rest) = rest.strip_prefix("mod ") else {
+                // Any non-mod, non-attribute code line clears the buffered
+                // path attribute (it was meant for something else).
+                pending_path = None;
                 continue;
             };
             let Some(mod_name) = rest.strip_suffix(';') else {
+                pending_path = None;
                 continue;
             };
             let mod_name = mod_name.trim();
             if mod_name.is_empty() || mod_name.contains(' ') {
+                pending_path = None;
                 continue;
             }
-            if let Some(child) = resolve_mod_file(parent_dir, mod_name) {
+            let child = match pending_path.take() {
+                Some(rel) => {
+                    let candidate = parent_dir.join(&rel);
+                    candidate.exists().then_some(candidate)
+                }
+                None => resolve_mod_file(&parent_dir, mod_name),
+            };
+            if let Some(child) = child {
                 let child_mod = if module_path.is_empty() {
                     mod_name.to_string()
                 } else {
@@ -387,7 +417,7 @@ fn index_file(
     let mut macro_cfgs = opts.macro_cfgs.clone();
     macro_cfgs.extend(collect_macro_cfg_defs(&file));
 
-    let parent_dir = path.parent().unwrap();
+    let parent_dir = submodule_dir(path);
     let mut visitor = ItemVisitor {
         name_filter: opts.name_filter,
         pub_only: opts.pub_only,
@@ -508,6 +538,59 @@ fn resolve_mod_file(parent: &Path, mod_name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Return the string value of the first `#[path = "..."]` attribute, if any.
+fn extract_path_attr(attrs: &[syn::Attribute]) -> Option<String> {
+    for attr in attrs {
+        if !attr.path().is_ident("path") {
+            continue;
+        }
+        if let syn::Meta::NameValue(nv) = &attr.meta {
+            if let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) = &nv.value
+            {
+                return Some(s.value());
+            }
+        }
+    }
+    None
+}
+
+/// Parse-free variant of `extract_path_attr` for the fast-path text scanner.
+/// Accepts a single attribute line like `#[path = "foo.rs"]` and returns
+/// the quoted value.
+fn parse_path_attr_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    let inner = line.strip_prefix("#[")?.strip_suffix("]")?;
+    let inner = inner.strip_prefix("path")?.trim_start();
+    let inner = inner.strip_prefix('=')?.trim();
+    // Expect a quoted string; take the content between first and last "
+    let start = inner.find('"')? + 1;
+    let end = inner.rfind('"')?;
+    if end <= start {
+        return None;
+    }
+    Some(inner[start..end].to_string())
+}
+
+/// Directory where the submodules of the given module file live.
+///
+/// - For `lib.rs` / `main.rs` / `mod.rs`: submodules sit next to the file
+///   (i.e. the file's own parent directory). This is the legacy layout.
+/// - For any other module file `foo.rs` (Rust 2018+ "mod file" style):
+///   submodules live in a sibling `foo/` directory. This is the layout used
+///   by code-generated crates like the AWS SDK (e.g. `types.rs` with
+///   children in `types/`).
+fn submodule_dir(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or(Path::new(""));
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    match stem {
+        "" | "lib" | "main" | "mod" => parent.to_path_buf(),
+        _ => parent.join(stem),
+    }
+}
+
 /// Recursively gather all `.rs` file paths under a directory.
 fn gather_rs_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -583,7 +666,7 @@ struct ItemVisitor<'a> {
     /// Cfg predicates extracted from `macro_rules!` definitions in this file.
     macro_cfgs: &'a MacroCfgMap,
     /// Parent directory for resolving `mod foo;` declarations.
-    parent_dir: &'a Path,
+    parent_dir: PathBuf,
     entries: &'a mut Vec<IndexEntry>,
     /// Files discovered via `include!()` that need indexing after the visit.
     included_files: Vec<(PathBuf, String, Vec<String>)>,
@@ -867,11 +950,20 @@ impl<'ast> Visit<'ast> for ItemVisitor<'_> {
         let mod_name = node.ident.to_string();
         let mut mod_cfg = self.inherited_cfg.clone();
         mod_cfg.extend(extract_cfg_attrs(&node.attrs));
+        let path_override = extract_path_attr(&node.attrs);
 
         if node.content.is_some() {
-            // Inline module — recurse with updated cfg context
+            // Inline module — recurse with updated cfg + parent_dir context.
+            // Any nested file-reference `mod bar;` inside this inline module
+            // resolves relative to <current_parent>/<mod_name> (or the
+            // `#[path = "..."]` override, treated as a directory for inline
+            // mods). This matches rustc's rule for inline modules in
+            // non-`mod.rs` files.
             let old_path = self.module_path.clone();
             let old_cfg = std::mem::replace(&mut self.inherited_cfg, mod_cfg);
+            let subdir_name = path_override.as_deref().unwrap_or(&mod_name);
+            let new_parent = self.parent_dir.join(subdir_name);
+            let old_parent = std::mem::replace(&mut self.parent_dir, new_parent);
             self.module_path = if old_path.is_empty() {
                 mod_name
             } else {
@@ -880,14 +972,24 @@ impl<'ast> Visit<'ast> for ItemVisitor<'_> {
             syn::visit::visit_item_mod(self, node);
             self.module_path = old_path;
             self.inherited_cfg = old_cfg;
+            self.parent_dir = old_parent;
         } else {
-            // File-reference mod — queue for indexing with cfg context
+            // File-reference mod — queue for indexing with cfg context.
+            // `#[path = "..."]` overrides the default `<mod_name>.rs` /
+            // `<mod_name>/mod.rs` lookup with an explicit relative path.
             let child_mod = if self.module_path.is_empty() {
                 mod_name.clone()
             } else {
                 format!("{}::{mod_name}", self.module_path)
             };
-            if let Some(child) = resolve_mod_file(self.parent_dir, &mod_name) {
+            let child = match &path_override {
+                Some(rel) => {
+                    let candidate = self.parent_dir.join(rel);
+                    candidate.exists().then_some(candidate)
+                }
+                None => resolve_mod_file(&self.parent_dir, &mod_name),
+            };
+            if let Some(child) = child {
                 self.child_mods.push((child, child_mod, mod_cfg));
             }
         }
@@ -1214,5 +1316,207 @@ cfg_net_unix! {
         assert_eq!(entries[0].cfg.len(), 2);
         assert!(entries[0].cfg.contains(&"unix".to_string()));
         assert!(entries[0].cfg.contains(&"feature = \"net\"".to_string()));
+    }
+
+    /// Rust 2018+ "mod file" style: a non-`mod.rs` parent file like `types.rs`
+    /// sits alongside a `types/` directory that holds its submodules.
+    /// `mod _inner;` inside `types.rs` should resolve to `types/_inner.rs`,
+    /// NOT `_inner.rs` at the crate root.
+    /// This layout is used pervasively by code-generated crates
+    /// (e.g. the `aws-sdk-*` crates).
+    #[test]
+    fn mod_file_style_submodule_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(src.join("types")).unwrap();
+        // lib.rs -> pub mod types;
+        fs::write(src.join("lib.rs"), "pub mod types;").unwrap();
+        // types.rs -> mod _inner; pub use crate::types::_inner::Inner;
+        fs::write(
+            src.join("types.rs"),
+            "mod _inner;\npub use crate::types::_inner::Inner;\n",
+        )
+        .unwrap();
+        // types/_inner.rs -> pub struct Inner;
+        fs::write(src.join("types").join("_inner.rs"), "pub struct Inner;\n").unwrap();
+
+        // Full-parse path: list_items with no text filter.
+        let entries = list_items(std::slice::from_ref(&src), true, None).unwrap();
+        let inner = entries
+            .iter()
+            .find(|e| e.name == "Inner" && e.module_path == "types::_inner")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected Inner at types::_inner, got: {:#?}",
+                    entries
+                        .iter()
+                        .map(|e| format!("{} @ {}", e.name, e.module_path))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(inner.kind, "struct");
+
+        // The `pub use` re-export should also make `Inner` visible at `types`.
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.name == "Inner" && e.module_path == "types"),
+            "expected re-exported Inner at module path `types`, got: {:#?}",
+            entries
+                .iter()
+                .filter(|e| e.name == "Inner")
+                .map(|e| format!("{} @ {}", e.name, e.module_path))
+                .collect::<Vec<_>>()
+        );
+
+        // Filtered-search path: index_crate with the fast text pre-filter.
+        // This exercises the `mod <name>;` line-scan fallback in index_file.
+        let filtered = index_crate(std::slice::from_ref(&src), "Inner", true, None).unwrap();
+        assert!(
+            filtered
+                .iter()
+                .any(|e| e.name == "Inner" && e.module_path == "types::_inner"),
+            "index_crate did not find Inner at types::_inner: {:#?}",
+            filtered
+        );
+    }
+
+    /// Classic `mod.rs` style must keep working: `foo/mod.rs` declaring
+    /// `mod bar;` resolves to `foo/bar.rs` (not `foo/foo/bar.rs`).
+    #[test]
+    fn mod_rs_style_submodule_resolution_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(src.join("foo")).unwrap();
+        fs::write(src.join("lib.rs"), "pub mod foo;").unwrap();
+        fs::write(src.join("foo").join("mod.rs"), "pub mod bar;").unwrap();
+        fs::write(src.join("foo").join("bar.rs"), "pub struct Baz;").unwrap();
+
+        let entries = list_items(&[src], true, None).unwrap();
+        let baz = entries
+            .iter()
+            .find(|e| e.name == "Baz")
+            .expect("Baz missing");
+        assert_eq!(baz.module_path, "foo::bar");
+    }
+
+    /// `#[path = "..."] mod foo;` at the crate root should resolve to the
+    /// custom relative path, not `<parent_dir>/foo.rs`.
+    #[test]
+    fn path_attr_file_reference_mod() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("lib.rs"),
+            "#[path = \"custom_name.rs\"]\npub mod foo;\n",
+        )
+        .unwrap();
+        // Note: file name is `custom_name.rs`, NOT `foo.rs`. Without #[path]
+        // support, rspeek would look for `foo.rs` and miss the file.
+        fs::write(src.join("custom_name.rs"), "pub struct Custom;").unwrap();
+
+        let entries = list_items(std::slice::from_ref(&src), true, None).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.name == "Custom" && e.module_path == "foo"),
+            "expected Custom at module path `foo`, got: {:#?}",
+            entries
+                .iter()
+                .map(|e| format!("{} @ {}", e.name, e.module_path))
+                .collect::<Vec<_>>()
+        );
+
+        // Fast-path text scanner should also follow #[path].
+        let filtered = index_crate(std::slice::from_ref(&src), "Custom", true, None).unwrap();
+        assert!(
+            filtered
+                .iter()
+                .any(|e| e.name == "Custom" && e.module_path == "foo"),
+            "fast-path did not find Custom: {:#?}",
+            filtered
+        );
+    }
+
+    /// The `libc` pattern: stacked `#[cfg(...)] #[path = "..."] mod imp;`
+    /// declarations should each be indexed with their cfg predicate attached,
+    /// so queries work regardless of platform.
+    #[test]
+    fn path_attr_stacked_cfg_variants_all_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("lib.rs"),
+            r#"
+#[cfg(unix)]
+#[path = "unix.rs"]
+pub mod imp;
+
+#[cfg(windows)]
+#[path = "windows.rs"]
+pub mod imp;
+"#,
+        )
+        .unwrap();
+        fs::write(src.join("unix.rs"), "pub struct UnixItem;").unwrap();
+        fs::write(src.join("windows.rs"), "pub struct WindowsItem;").unwrap();
+
+        let entries = list_items(&[src], true, None).unwrap();
+        let unix = entries
+            .iter()
+            .find(|e| e.name == "UnixItem")
+            .expect("UnixItem missing");
+        assert_eq!(unix.module_path, "imp");
+        assert!(
+            unix.cfg.iter().any(|c| c == "unix"),
+            "UnixItem should carry cfg=unix, got: {:?}",
+            unix.cfg
+        );
+        let win = entries
+            .iter()
+            .find(|e| e.name == "WindowsItem")
+            .expect("WindowsItem missing");
+        assert_eq!(win.module_path, "imp");
+        assert!(
+            win.cfg.iter().any(|c| c == "windows"),
+            "WindowsItem should carry cfg=windows, got: {:?}",
+            win.cfg
+        );
+    }
+
+    /// Nested inline mod inside a non-`mod.rs` parent file. Rust resolves
+    /// a file-reference mod declared inside an inline module by descending
+    /// one more directory level per inline mod: `foo.rs` with
+    /// `mod outer { mod bar; }` means `bar` lives at `foo/outer/bar.rs`
+    /// (or `foo/outer/bar/mod.rs`).
+    #[test]
+    fn nested_inline_mod_inside_mod_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(src.join("foo").join("outer")).unwrap();
+        fs::write(src.join("lib.rs"), "pub mod foo;").unwrap();
+        fs::write(src.join("foo.rs"), "pub mod outer {\n    pub mod bar;\n}\n").unwrap();
+        fs::write(
+            src.join("foo").join("outer").join("bar.rs"),
+            "pub struct Nested;",
+        )
+        .unwrap();
+
+        let entries = list_items(&[src], true, None).unwrap();
+        let nested = entries
+            .iter()
+            .find(|e| e.name == "Nested")
+            .unwrap_or_else(|| {
+                panic!(
+                    "Nested not found. Entries: {:#?}",
+                    entries
+                        .iter()
+                        .map(|e| format!("{} @ {}", e.name, e.module_path))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(nested.module_path, "foo::outer::bar");
     }
 }
