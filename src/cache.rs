@@ -116,19 +116,17 @@ fn save_inner(workspace_root: &Path, no_deps: bool, metadata: &Metadata) -> Resu
 
 /// Remove cache entries older than 30 days. Best-effort.
 pub fn prune() {
-    let _ = prune_inner();
+    let _ = prune_dir(&cache_base_dir());
 }
 
-fn prune_inner() -> Result<()> {
-    let base = cache_base_dir();
-    let entries = fs::read_dir(&base).context("read cache dir")?;
+fn prune_dir(base: &Path) -> Result<()> {
+    let entries = fs::read_dir(base).context("read cache dir")?;
     let now = SystemTime::now();
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
-        // Check if all files in this dir are older than PRUNE_AGE
         let Ok(files) = fs::read_dir(&path) else {
             continue;
         };
@@ -252,10 +250,9 @@ edition = "2021"
     #[test]
     fn prune_removes_old_entries() {
         let tmp = tempfile::tempdir().unwrap();
-        // Override cache base via XDG_CACHE_HOME
-        std::env::set_var("XDG_CACHE_HOME", tmp.path());
+        let base = tmp.path().join("rspeek");
 
-        let old_dir = cache_base_dir().join("0000000000000001");
+        let old_dir = base.join("0000000000000001");
         fs::create_dir_all(&old_dir).unwrap();
         let old_file = old_dir.join("metadata-full.json");
         fs::write(&old_file, b"{}").unwrap();
@@ -265,24 +262,20 @@ edition = "2021"
         filetime::set_file_mtime(&old_file, filetime::FileTime::from_system_time(old_time))
             .unwrap();
 
-        prune();
+        prune_dir(&base).unwrap();
         assert!(!old_dir.exists(), "old entry should be pruned");
-
-        std::env::remove_var("XDG_CACHE_HOME");
     }
 
     #[test]
     fn prune_keeps_recent_entries() {
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CACHE_HOME", tmp.path());
+        let base = tmp.path().join("rspeek");
 
-        let recent_dir = cache_base_dir().join("0000000000000002");
+        let recent_dir = base.join("0000000000000002");
         fs::create_dir_all(&recent_dir).unwrap();
         fs::write(recent_dir.join("metadata-full.json"), b"{}").unwrap();
 
-        prune();
+        prune_dir(&base).unwrap();
         assert!(recent_dir.exists(), "recent entry should be kept");
-
-        std::env::remove_var("XDG_CACHE_HOME");
     }
 }

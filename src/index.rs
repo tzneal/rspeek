@@ -46,7 +46,7 @@ struct CollectOpts<'a> {
 
 /// Build an index of items under `dirs` matching `item_name`.
 /// Uses a fast text pre-filter: only parses files containing `item_name`.
-/// Falls back to full parse if the fast pass finds nothing.
+/// Does NOT fall back to full parse — caller is responsible for fallback.
 pub fn index_crate(
     dirs: &[PathBuf],
     item_name: &str,
@@ -60,20 +60,35 @@ pub fn index_crate(
         out_dir,
         text_filter: Some(item_name),
         inherited_cfg: Vec::new(),
-        macro_cfgs: macro_cfgs.clone(),
+        macro_cfgs,
     };
     let mut entries = Vec::new();
     for dir in dirs {
         entries.extend(collect(dir, opts.clone())?);
     }
-    if entries.is_empty() {
-        let opts = CollectOpts {
-            text_filter: None,
-            ..opts
-        };
-        for dir in dirs {
-            entries.extend(collect(dir, opts.clone())?);
-        }
+    Ok(entries)
+}
+
+/// Like `index_crate` but without the text pre-filter (full parse).
+/// Use this as a fallback when the text-filtered pass finds nothing globally.
+pub fn index_crate_full_parse(
+    dirs: &[PathBuf],
+    item_name: &str,
+    pub_only: bool,
+    out_dir: Option<&Path>,
+) -> Result<Vec<IndexEntry>> {
+    let macro_cfgs = prescan_macro_cfgs(dirs);
+    let opts = CollectOpts {
+        name_filter: Some(item_name),
+        pub_only,
+        out_dir,
+        text_filter: None,
+        inherited_cfg: Vec::new(),
+        macro_cfgs,
+    };
+    let mut entries = Vec::new();
+    for dir in dirs {
+        entries.extend(collect(dir, opts.clone())?);
     }
     Ok(entries)
 }
