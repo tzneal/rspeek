@@ -1,8 +1,10 @@
 pub mod cache;
+pub mod cfg;
 pub mod cli;
 pub mod index;
 pub mod output;
 pub mod query;
+pub mod reexport;
 pub mod resolve;
 pub mod suggest;
 

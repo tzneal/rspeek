@@ -7,6 +7,13 @@ use std::path::{Path, PathBuf};
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
+use crate::cache::{
+    extract_item_names_from_source, is_registry_path, read_name_index, write_name_index,
+    RSPEEK_INDEX_FILE,
+};
+use crate::cfg::{collect_macro_cfg_defs, extract_cfg_attrs, MacroCfgMap};
+use crate::reexport::{self, ReExport};
+
 /// A found item in the source index.
 #[derive(Debug, Serialize)]
 pub struct IndexEntry {
@@ -42,89 +49,6 @@ struct CollectOpts<'a> {
     inherited_cfg: Vec<String>,
     /// Cfg predicates extracted from `macro_rules!` definitions across the crate.
     macro_cfgs: MacroCfgMap,
-}
-
-const RSPEEK_INDEX_FILE: &str = ".rspeek-index";
-
-/// Read cached item names from a `.rspeek-index` file.
-fn read_name_index(dir: &Path) -> Option<Vec<String>> {
-    let path = dir.join(RSPEEK_INDEX_FILE);
-    let content = fs::read_to_string(&path).ok()?;
-    Some(content.lines().map(String::from).collect())
-}
-
-/// Write item names to a `.rspeek-index` file. Best-effort.
-fn write_name_index(dir: &Path, names: &[String]) {
-    let path = dir.join(RSPEEK_INDEX_FILE);
-    let _ = fs::write(&path, names.join("\n"));
-}
-
-/// Check if a path is inside a cargo registry (immutable dep source).
-fn is_registry_path(path: &Path) -> bool {
-    let s = path.to_string_lossy();
-    s.contains("/registry/src/") || s.contains("/.cargo/registry/")
-}
-
-/// Extract public item names from source text using cheap pattern matching.
-/// Not a full parse — just looks for `pub (struct|enum|trait|fn|type|const|static|union) Name`.
-fn extract_item_names_from_source(source: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    for line in source.lines() {
-        let trimmed = line.trim();
-        let rest = if let Some(r) = trimmed.strip_prefix("pub ") {
-            r
-        } else if trimmed.starts_with("pub(") {
-            // pub(crate), pub(super), etc — still extract the name
-            match trimmed.find(')') {
-                Some(i) => trimmed[i + 1..].trim_start(),
-                None => continue,
-            }
-        } else {
-            continue;
-        };
-        let name = extract_name_after_keyword(rest);
-        if let Some(n) = name {
-            if n.starts_with(|c: char| c.is_alphabetic()) {
-                names.push(n.to_string());
-            }
-        }
-    }
-    names
-}
-
-/// Given text after `pub `, try to extract an item name.
-fn extract_name_after_keyword(s: &str) -> Option<&str> {
-    let keywords = [
-        "struct ", "enum ", "trait ", "fn ", "type ", "const ", "static ", "union ", "macro ",
-    ];
-    for kw in &keywords {
-        if let Some(rest) = s.strip_prefix(kw) {
-            let rest = rest.trim_start();
-            let end = rest
-                .find(|c: char| !c.is_alphanumeric() && c != '_')
-                .unwrap_or(rest.len());
-            if end > 0 {
-                return Some(&rest[..end]);
-            }
-        }
-    }
-    // Handle `pub async fn`
-    if let Some(rest) = s.strip_prefix("async fn ") {
-        let rest = rest.trim_start();
-        let end = rest
-            .find(|c: char| !c.is_alphanumeric() && c != '_')
-            .unwrap_or(rest.len());
-        if end > 0 {
-            return Some(&rest[..end]);
-        }
-    }
-    // Handle `pub unsafe fn`, `pub const fn`, `pub unsafe trait`
-    for prefix in ["unsafe ", "const "] {
-        if let Some(rest) = s.strip_prefix(prefix) {
-            return extract_name_after_keyword(rest);
-        }
-    }
-    None
 }
 
 /// Build an index of items under `dirs` matching `item_name`.
@@ -206,71 +130,6 @@ pub fn list_items(
     Ok(entries)
 }
 
-/// Collect `pub use <crate_name>` re-exports from a crate's root source file.
-/// Returns `(original_crate_name, optional_alias)` pairs for re-exports that
-/// refer to external crates (not `crate::`, `self::`, or `super::` paths).
-pub fn cross_crate_reexports(
-    src_dir: &Path,
-    _out_dir: Option<&Path>,
-) -> Vec<(String, Option<String>)> {
-    let lib_rs = src_dir.join("lib.rs");
-    let path = if lib_rs.exists() {
-        lib_rs
-    } else {
-        return Vec::new();
-    };
-    let Ok(source) = fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    let Ok(file) = syn::parse_file(&source) else {
-        return Vec::new();
-    };
-    let mut result = Vec::new();
-    for item in &file.items {
-        if let syn::Item::Use(u) = item {
-            if !is_pub(&u.vis) {
-                continue;
-            }
-            collect_extern_reexports(&u.tree, &mut result);
-        }
-    }
-    result
-}
-
-/// Extract bare external crate re-exports from a use tree.
-/// `pub use ttrpc;` → ("ttrpc", None)
-/// `pub use other as aliased;` → ("other", Some("aliased"))
-/// Skips paths starting with `crate`, `self`, `super`.
-fn collect_extern_reexports(tree: &syn::UseTree, out: &mut Vec<(String, Option<String>)>) {
-    match tree {
-        syn::UseTree::Name(n) => {
-            let name = n.ident.to_string();
-            if !is_internal_path(&name) {
-                out.push((name, None));
-            }
-        }
-        syn::UseTree::Rename(r) => {
-            let name = r.ident.to_string();
-            if !is_internal_path(&name) {
-                out.push((name, Some(r.rename.to_string())));
-            }
-        }
-        syn::UseTree::Path(_) => {
-            // `pub use ttrpc::context::with_timeout;` — not a bare crate re-export, skip
-        }
-        syn::UseTree::Group(g) => {
-            for tree in &g.items {
-                collect_extern_reexports(tree, out);
-            }
-        }
-        syn::UseTree::Glob(_) => {}
-    }
-}
-
-fn is_internal_path(name: &str) -> bool {
-    matches!(name, "crate" | "self" | "super")
-}
-
 /// Find all `impl` blocks for `type_name` under `dirs`.
 pub fn find_impls(
     dirs: &[PathBuf],
@@ -347,7 +206,7 @@ fn collect(src_dir: &Path, opts: CollectOpts) -> Result<Vec<IndexEntry>> {
         main_rs
     } else {
         walk_all_rs(src_dir, &opts, &mut entries, &mut reexports, &mut visited)?;
-        resolve_reexports(&mut entries, &reexports, opts.name_filter);
+        reexport::resolve_reexports(&mut entries, &reexports, opts.name_filter);
         return Ok(entries);
     };
 
@@ -359,72 +218,8 @@ fn collect(src_dir: &Path, opts: CollectOpts) -> Result<Vec<IndexEntry>> {
         &mut reexports,
         &mut visited,
     )?;
-    resolve_reexports(&mut entries, &reexports, opts.name_filter);
+    reexport::resolve_reexports(&mut entries, &reexports, opts.name_filter);
     Ok(entries)
-}
-
-/// A `pub use` re-export to resolve after indexing.
-struct ReExport {
-    /// The item name being re-exported (last segment of the use path).
-    name: String,
-    /// Optional alias (`pub use foo::Bar as Baz` → alias = "Baz").
-    alias: Option<String>,
-    /// Module path segments before the item name (e.g., `["errors"]` for `pub use errors::Error`).
-    source_segments: Vec<String>,
-    /// Module path where the re-export appears.
-    reexport_module_path: String,
-}
-
-/// After all files are indexed, resolve `pub use` re-exports by finding
-/// matching entries and creating aliases at the re-export's module path.
-fn resolve_reexports(
-    entries: &mut Vec<IndexEntry>,
-    reexports: &[ReExport],
-    name_filter: Option<&str>,
-) {
-    let mut new_entries = Vec::new();
-    for re in reexports {
-        let visible_name = re.alias.as_deref().unwrap_or(&re.name);
-        if let Some(filter) = name_filter {
-            if visible_name != filter {
-                continue;
-            }
-        }
-        // Find the original entry: name matches and module path ends with the source segments
-        let original = entries.iter().find(|e| {
-            e.name == re.name && reexport_path_matches(&e.module_path, &re.source_segments)
-        });
-        if let Some(orig) = original {
-            // Don't create duplicate if already visible at this path
-            let already_exists = entries
-                .iter()
-                .chain(new_entries.iter())
-                .any(|e| e.name == visible_name && e.module_path == re.reexport_module_path);
-            if !already_exists {
-                new_entries.push(IndexEntry {
-                    name: visible_name.to_string(),
-                    kind: orig.kind,
-                    module_path: re.reexport_module_path.clone(),
-                    file: orig.file.clone(),
-                    start_line: orig.start_line,
-                    end_line: orig.end_line,
-                    cfg: orig.cfg.clone(),
-                });
-            }
-        }
-    }
-    entries.extend(new_entries);
-}
-
-/// Check if an entry's module path matches the source segments of a re-export.
-/// `pub use errors::Error` in root → source_segments = ["errors"], matches module_path "errors".
-/// `pub use sub::inner::Foo` in root → source_segments = ["sub", "inner"], matches "sub::inner".
-fn reexport_path_matches(entry_module_path: &str, source_segments: &[String]) -> bool {
-    if source_segments.is_empty() {
-        return true;
-    }
-    let expected = source_segments.join("::");
-    entry_module_path == expected || entry_module_path.ends_with(&format!("::{expected}"))
 }
 
 fn index_file(
@@ -577,59 +372,12 @@ fn index_file(
     for item in &file.items {
         if let syn::Item::Use(u) = item {
             if is_pub(&u.vis) {
-                collect_reexports(&u.tree, &[], module_path, reexports);
+                reexport::collect_reexports(&u.tree, &[], module_path, reexports);
             }
         }
     }
 
     Ok(())
-}
-
-/// Recursively collect re-exported item names from a `use` tree.
-fn collect_reexports(
-    tree: &syn::UseTree,
-    prefix: &[String],
-    reexport_module_path: &str,
-    reexports: &mut Vec<ReExport>,
-) {
-    match tree {
-        syn::UseTree::Path(p) => {
-            let seg = p.ident.to_string();
-            // Skip `crate::`, `self::`, `super::` prefixes — just continue into the tree
-            if seg == "crate" || seg == "self" || seg == "super" {
-                collect_reexports(&p.tree, prefix, reexport_module_path, reexports);
-            } else {
-                let mut new_prefix = prefix.to_vec();
-                new_prefix.push(seg);
-                collect_reexports(&p.tree, &new_prefix, reexport_module_path, reexports);
-            }
-        }
-        syn::UseTree::Name(n) => {
-            let name = n.ident.to_string();
-            reexports.push(ReExport {
-                name,
-                alias: None,
-                source_segments: prefix.to_vec(),
-                reexport_module_path: reexport_module_path.to_string(),
-            });
-        }
-        syn::UseTree::Rename(r) => {
-            reexports.push(ReExport {
-                name: r.ident.to_string(),
-                alias: Some(r.rename.to_string()),
-                source_segments: prefix.to_vec(),
-                reexport_module_path: reexport_module_path.to_string(),
-            });
-        }
-        syn::UseTree::Group(g) => {
-            for tree in &g.items {
-                collect_reexports(tree, prefix, reexport_module_path, reexports);
-            }
-        }
-        syn::UseTree::Glob(_) => {
-            // Skip glob re-exports — too complex to resolve statically
-        }
-    }
 }
 
 fn resolve_mod_file(parent: &Path, mod_name: &str) -> Option<PathBuf> {
@@ -736,9 +484,6 @@ fn walk_all_rs(
     }
     Ok(())
 }
-
-/// Mapping from macro name → cfg predicates extracted from `macro_rules!` definitions.
-type MacroCfgMap = std::collections::HashMap<String, Vec<String>>;
 
 /// Pre-scan all `.rs` files under `dirs` for `macro_rules!` cfg-gating definitions.
 /// Also checks whether any file contains `item_name` (when provided).
@@ -854,84 +599,6 @@ impl ItemVisitor<'_> {
 
 fn is_pub(vis: &syn::Visibility) -> bool {
     matches!(vis, syn::Visibility::Public(_))
-}
-
-/// Extract `#[cfg(...)]` predicate strings from a list of attributes.
-fn extract_cfg_attrs(attrs: &[syn::Attribute]) -> Vec<String> {
-    let mut cfgs = Vec::new();
-    for attr in attrs {
-        if !attr.path().is_ident("cfg") {
-            continue;
-        }
-        if let syn::Meta::List(list) = &attr.meta {
-            cfgs.push(list.tokens.to_string());
-        }
-    }
-    cfgs
-}
-
-/// Scan a file for `macro_rules!` definitions that follow the cfg-gating pattern:
-/// ```ignore
-/// macro_rules! cfg_xxx {
-///     ($($item:item)*) => { $( #[cfg(PRED)] $item )* }
-/// }
-/// ```
-/// Returns a map from macro name → vec of cfg predicate strings.
-fn collect_macro_cfg_defs(file: &syn::File) -> MacroCfgMap {
-    let mut map = MacroCfgMap::new();
-    for item in &file.items {
-        let syn::Item::Macro(m) = item else { continue };
-        let Some(ident) = &m.ident else { continue };
-        if !m.mac.path.is_ident("macro_rules") {
-            continue;
-        }
-        let name = ident.to_string();
-        if let Some(cfgs) = extract_cfg_from_macro_body(&m.mac.tokens) {
-            if !cfgs.is_empty() {
-                map.insert(name, cfgs);
-            }
-        }
-    }
-    map
-}
-
-/// Try to extract cfg predicates from a macro_rules! body.
-/// Looks for `#[cfg(...)]` attributes before `$item` in the expansion.
-fn extract_cfg_from_macro_body(tokens: &proc_macro2::TokenStream) -> Option<Vec<String>> {
-    // proc_macro2 to_string() adds spaces between all tokens.
-    // Strip whitespace for reliable matching, then normalize output.
-    let s = tokens.to_string();
-    let compact: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    let after_arrow = compact.split("=>").nth(1)?;
-    let mut cfgs = Vec::new();
-    let mut rest = after_arrow;
-    while let Some(pos) = rest.find("#[cfg(") {
-        let start = pos + 6;
-        let substr = &rest[start..];
-        let mut depth = 1i32;
-        let mut end = 0;
-        for (i, ch) in substr.char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = i;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if end > 0 {
-            // Normalize: add space after commas and around = for readability
-            let raw = &substr[..end];
-            let pred = raw.replace(',', ", ").replace('=', " = ");
-            cfgs.push(pred);
-        }
-        rest = &rest[start + end..];
-    }
-    Some(cfgs)
 }
 
 /// Resolve the path argument of an `include!()` macro invocation.
@@ -1327,7 +994,7 @@ mod tests {
             "pub use ttrpc;\npub use other_crate as aliased;\npub struct Local;",
         )
         .unwrap();
-        let reexports = cross_crate_reexports(dir.path(), None);
+        let reexports = crate::reexport::cross_crate_reexports(dir.path(), None);
         assert_eq!(reexports.len(), 2);
         assert!(reexports
             .iter()
@@ -1347,7 +1014,7 @@ mod tests {
             "pub use crate::foo::Bar;\npub use self::baz;\nmod foo { pub struct Bar; }",
         )
         .unwrap();
-        let reexports = cross_crate_reexports(dir.path(), None);
+        let reexports = crate::reexport::cross_crate_reexports(dir.path(), None);
         assert!(
             reexports.is_empty(),
             "internal re-exports should not appear: {reexports:?}"
@@ -1663,45 +1330,5 @@ pub mod imp;
                 )
             });
         assert_eq!(nested.module_path, "foo::outer::bar");
-    }
-
-    #[test]
-    fn extract_item_names_finds_common_patterns() {
-        let source = r#"
-pub struct Foo;
-pub enum Bar {}
-pub trait Baz {}
-pub fn quux() {}
-pub type Alias = u32;
-pub const MAX: u32 = 10;
-pub static GLOBAL: &str = "hi";
-pub union MyUnion { f1: u32 }
-pub async fn async_fn() {}
-pub unsafe fn unsafe_fn() {}
-pub(crate) struct Internal;
-struct Private;
-"#;
-        let names = extract_item_names_from_source(source);
-        assert!(names.contains(&"Foo".to_string()));
-        assert!(names.contains(&"Bar".to_string()));
-        assert!(names.contains(&"Baz".to_string()));
-        assert!(names.contains(&"quux".to_string()));
-        assert!(names.contains(&"Alias".to_string()));
-        assert!(names.contains(&"MAX".to_string()));
-        assert!(names.contains(&"GLOBAL".to_string()));
-        assert!(names.contains(&"MyUnion".to_string()));
-        assert!(names.contains(&"async_fn".to_string()));
-        assert!(names.contains(&"unsafe_fn".to_string()));
-        assert!(names.contains(&"Internal".to_string()));
-        assert!(!names.contains(&"Private".to_string()));
-    }
-
-    #[test]
-    fn name_index_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let names = vec!["Foo".to_string(), "Bar".to_string(), "Baz".to_string()];
-        write_name_index(dir.path(), &names);
-        let loaded = read_name_index(dir.path()).unwrap();
-        assert_eq!(loaded, names);
     }
 }

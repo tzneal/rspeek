@@ -143,6 +143,91 @@ fn prune_dir(base: &Path) -> Result<()> {
     Ok(())
 }
 
+// --- Name-index cache for dependency crates ---
+
+pub(crate) const RSPEEK_INDEX_FILE: &str = ".rspeek-index";
+
+/// Read cached item names from a `.rspeek-index` file.
+pub(crate) fn read_name_index(dir: &Path) -> Option<Vec<String>> {
+    let path = dir.join(RSPEEK_INDEX_FILE);
+    let content = fs::read_to_string(&path).ok()?;
+    Some(content.lines().map(String::from).collect())
+}
+
+/// Write item names to a `.rspeek-index` file. Best-effort.
+pub(crate) fn write_name_index(dir: &Path, names: &[String]) {
+    let path = dir.join(RSPEEK_INDEX_FILE);
+    let _ = fs::write(&path, names.join("\n"));
+}
+
+/// Check if a path is inside a cargo registry (immutable dep source).
+pub(crate) fn is_registry_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    s.contains("/registry/src/") || s.contains("/.cargo/registry/")
+}
+
+/// Extract public item names from source text using cheap pattern matching.
+/// Not a full parse — just looks for `pub (struct|enum|trait|fn|type|const|static|union) Name`.
+pub(crate) fn extract_item_names_from_source(source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let rest = if let Some(r) = trimmed.strip_prefix("pub ") {
+            r
+        } else if trimmed.starts_with("pub(") {
+            // pub(crate), pub(super), etc — still extract the name
+            match trimmed.find(')') {
+                Some(i) => trimmed[i + 1..].trim_start(),
+                None => continue,
+            }
+        } else {
+            continue;
+        };
+        let name = extract_name_after_keyword(rest);
+        if let Some(n) = name {
+            if n.starts_with(|c: char| c.is_alphabetic()) {
+                names.push(n.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Given text after `pub `, try to extract an item name.
+pub(crate) fn extract_name_after_keyword(s: &str) -> Option<&str> {
+    let keywords = [
+        "struct ", "enum ", "trait ", "fn ", "type ", "const ", "static ", "union ", "macro ",
+    ];
+    for kw in &keywords {
+        if let Some(rest) = s.strip_prefix(kw) {
+            let rest = rest.trim_start();
+            let end = rest
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(rest.len());
+            if end > 0 {
+                return Some(&rest[..end]);
+            }
+        }
+    }
+    // Handle `pub async fn`
+    if let Some(rest) = s.strip_prefix("async fn ") {
+        let rest = rest.trim_start();
+        let end = rest
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
+        if end > 0 {
+            return Some(&rest[..end]);
+        }
+    }
+    // Handle `pub unsafe fn`, `pub const fn`, `pub unsafe trait`
+    for prefix in ["unsafe ", "const "] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            return extract_name_after_keyword(rest);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,5 +362,45 @@ edition = "2021"
 
         prune_dir(&base).unwrap();
         assert!(recent_dir.exists(), "recent entry should be kept");
+    }
+
+    #[test]
+    fn name_index_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = vec!["Foo".to_string(), "Bar".to_string(), "Baz".to_string()];
+        write_name_index(dir.path(), &names);
+        let loaded = read_name_index(dir.path()).unwrap();
+        assert_eq!(loaded, names);
+    }
+
+    #[test]
+    fn extract_item_names_finds_common_patterns() {
+        let source = r#"
+pub struct Foo;
+pub enum Bar {}
+pub trait Baz {}
+pub fn quux() {}
+pub type Alias = u32;
+pub const MAX: u32 = 10;
+pub static GLOBAL: &str = "hi";
+pub union MyUnion { f1: u32 }
+pub async fn async_fn() {}
+pub unsafe fn unsafe_fn() {}
+pub(crate) struct Internal;
+struct Private;
+"#;
+        let names = extract_item_names_from_source(source);
+        assert!(names.contains(&"Foo".to_string()));
+        assert!(names.contains(&"Bar".to_string()));
+        assert!(names.contains(&"Baz".to_string()));
+        assert!(names.contains(&"quux".to_string()));
+        assert!(names.contains(&"Alias".to_string()));
+        assert!(names.contains(&"MAX".to_string()));
+        assert!(names.contains(&"GLOBAL".to_string()));
+        assert!(names.contains(&"MyUnion".to_string()));
+        assert!(names.contains(&"async_fn".to_string()));
+        assert!(names.contains(&"unsafe_fn".to_string()));
+        assert!(names.contains(&"Internal".to_string()));
+        assert!(!names.contains(&"Private".to_string()));
     }
 }

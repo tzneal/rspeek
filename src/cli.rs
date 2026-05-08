@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use crate::index::{self, IndexEntry};
 use crate::output;
 use crate::query;
+use crate::reexport;
 use crate::resolve::{self, ResolvedCrate};
 use crate::suggest;
 use crate::Output;
@@ -42,6 +43,15 @@ pub struct Cli {
 pub struct NotFound {
     pub message: String,
     pub suggestions: Vec<String>,
+}
+
+impl From<anyhow::Error> for NotFound {
+    fn from(e: anyhow::Error) -> Self {
+        NotFound {
+            message: e.to_string(),
+            suggestions: vec![],
+        }
+    }
 }
 
 pub const LLM_HELP: &str = "\
@@ -158,10 +168,7 @@ pub fn run(cli: &Cli, out: &mut Output) -> std::result::Result<(), NotFound> {
     // Phase 1: try to resolve using workspace members only (cargo metadata
     // --no-deps, ~20× faster than full). Skip phase 1 if the query references
     // a crate name that isn't a workspace member, since it can't succeed.
-    let members = resolve::Workspace::load_members_only().map_err(|e| NotFound {
-        message: e.to_string(),
-        suggestions: vec![],
-    })?;
+    let members = resolve::Workspace::load_members_only().map_err(NotFound::from)?;
     let query = query::Query::parse(first, cli.second.as_deref(), &members);
     let can_try_phase1 = query
         .crate_filter()
@@ -180,10 +187,7 @@ pub fn run(cli: &Cli, out: &mut Output) -> std::result::Result<(), NotFound> {
     // Phase 2: full metadata, re-parse query (so a bare `rspeek anyhow`
     // reclassifies from Unscoped to CrateOnly once deps are known), and
     // dispatch.
-    let ws = resolve::Workspace::load().map_err(|e| NotFound {
-        message: e.to_string(),
-        suggestions: vec![],
-    })?;
+    let ws = resolve::Workspace::load().map_err(NotFound::from)?;
     let query = query::Query::parse(first, cli.second.as_deref(), &ws);
     dispatch(cli, &ws, &query, out)
 }
@@ -383,7 +387,7 @@ fn cross_crate_redirect(
         let Some(src_dir) = c.source_dirs.first() else {
             continue;
         };
-        let reexports = index::cross_crate_reexports(src_dir, c.out_dir.as_deref());
+        let reexports = reexport::cross_crate_reexports(src_dir, c.out_dir.as_deref());
         for (crate_name, alias) in &reexports {
             let visible = alias.as_deref().unwrap_or(crate_name);
             if resolve::normalize(visible) != resolve::normalize(first_seg) {
@@ -412,7 +416,7 @@ fn search_crates_for<'a>(
     query: &query::Query,
 ) -> std::result::Result<Vec<(&'a ResolvedCrate, IndexEntry)>, NotFound> {
     let do_pass = |use_text_filter: bool| -> std::result::Result<Vec<_>, NotFound> {
-        let results: Vec<Result<Vec<(&ResolvedCrate, IndexEntry)>, _>> = crates
+        let results: Vec<std::result::Result<Vec<(&ResolvedCrate, IndexEntry)>, NotFound>> = crates
             .par_iter()
             .map(|c| {
                 let entries = index::index_crate(
@@ -422,10 +426,7 @@ fn search_crates_for<'a>(
                     c.out_dir.as_deref(),
                     use_text_filter,
                 )
-                .map_err(|e| NotFound {
-                    message: e.to_string(),
-                    suggestions: vec![],
-                })?;
+                .map_err(NotFound::from)?;
                 Ok(entries
                     .into_iter()
                     .filter(|entry| query.matches_module_path(&entry.module_path))
@@ -563,10 +564,7 @@ fn run_item_search(
                 )
             })
             .collect::<Result<_>>()
-            .map_err(|e| NotFound {
-                message: e.to_string(),
-                suggestions: vec![],
-            })?;
+            .map_err(NotFound::from)?;
         out.println(&serde_json::to_string(&json_entries).unwrap());
     } else if matches.len() == 1 {
         let (c, entry) = &matches[0];
@@ -586,10 +584,7 @@ fn run_item_search(
                 cli.signature,
                 &other_versions[0],
             )
-            .map_err(|e| NotFound {
-                message: e.to_string(),
-                suggestions: vec![],
-            })?,
+            .map_err(NotFound::from)?,
         );
     } else {
         out.println(&format!(
