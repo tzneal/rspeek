@@ -403,7 +403,9 @@ fn cross_crate_redirect(
 }
 
 /// Run `index_crate` in parallel across the given crates, filtering entries by
-/// the query's module path, and collecting the results.
+/// the query's module path, and collecting the results. If the text-filtered
+/// pass finds nothing across ALL crates, falls back to full-parse (global
+/// fallback) to catch items hidden inside macro bodies.
 fn search_crates_for<'a>(
     crates: &[&'a ResolvedCrate],
     item_name: &str,
@@ -432,6 +434,32 @@ fn search_crates_for<'a>(
     let mut matches = Vec::new();
     for r in results {
         matches.extend(r?);
+    }
+    // Global fallback: if text-filtered pass found nothing, retry with full parse
+    if matches.is_empty() {
+        let results: Vec<Result<Vec<(&ResolvedCrate, IndexEntry)>, _>> = crates
+            .par_iter()
+            .map(|c| {
+                let entries = index::index_crate_full_parse(
+                    &c.source_dirs,
+                    item_name,
+                    !c.is_workspace_member,
+                    c.out_dir.as_deref(),
+                )
+                .map_err(|e| NotFound {
+                    message: e.to_string(),
+                    suggestions: vec![],
+                })?;
+                Ok(entries
+                    .into_iter()
+                    .filter(|entry| query.matches_module_path(&entry.module_path))
+                    .map(|entry| (*c, entry))
+                    .collect())
+            })
+            .collect();
+        for r in results {
+            matches.extend(r?);
+        }
     }
     Ok(matches)
 }
