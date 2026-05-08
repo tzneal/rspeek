@@ -22,14 +22,20 @@ pub fn normalize(name: &str) -> String {
     name.replace('-', "_")
 }
 
-/// Find the OUT_DIR for a crate by scanning `<target_dir>/*/build/<crate>-*/out/`.
-/// Returns the most recently modified match if multiple exist.
-fn find_out_dir(target_dir: &Path, crate_name: &str) -> Option<PathBuf> {
-    let prefix = format!("{crate_name}-");
-    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
-    // Check all profile dirs (debug, release, etc.)
+/// Build a map from crate name → its most recently modified OUT_DIR by walking
+/// `<target_dir>/*/build/*/out/` a single time.
+///
+/// Build-script output directories are named `<crate_name>-<16_hex_hash>`. We
+/// strip the trailing `-<hash>` to recover the crate name. When multiple
+/// directories exist for the same crate (different profiles, or stale hashes),
+/// we keep the one with the newest mtime.
+fn build_out_dir_map(
+    target_dir: &Path,
+) -> std::collections::HashMap<String, (PathBuf, std::time::SystemTime)> {
+    let mut map: std::collections::HashMap<String, (PathBuf, std::time::SystemTime)> =
+        std::collections::HashMap::new();
     let Ok(profiles) = std::fs::read_dir(target_dir) else {
-        return None;
+        return map;
     };
     for profile in profiles.flatten() {
         let build_dir = profile.path().join("build");
@@ -41,21 +47,37 @@ fn find_out_dir(target_dir: &Path, crate_name: &str) -> Option<PathBuf> {
             let Some(name_str) = name.to_str() else {
                 continue;
             };
-            if !name_str.starts_with(&prefix) {
+            let Some(crate_name) = strip_hash_suffix(name_str) else {
+                continue;
+            };
+            let out = entry.path().join("out");
+            if !out.is_dir() {
                 continue;
             }
-            let out = entry.path().join("out");
-            if out.is_dir() {
-                let mtime = std::fs::metadata(&out)
-                    .and_then(|m| m.modified())
-                    .unwrap_or(std::time::UNIX_EPOCH);
-                if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
-                    best = Some((out, mtime));
+            let mtime = std::fs::metadata(&out)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            match map.get(crate_name) {
+                Some((_, t)) if *t >= mtime => {}
+                _ => {
+                    map.insert(crate_name.to_string(), (out, mtime));
                 }
             }
         }
     }
-    best.map(|(p, _)| p)
+    map
+}
+
+/// Strip a trailing `-<16 hex chars>` suffix, returning the prefix. This
+/// recovers the crate name from a cargo build-dir entry like
+/// `async-trait-0abc123456789def`.
+fn strip_hash_suffix(name: &str) -> Option<&str> {
+    let (prefix, hash) = name.rsplit_once('-')?;
+    if hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(prefix)
+    } else {
+        None
+    }
 }
 
 /// All resolved crates from `cargo metadata`.
@@ -73,6 +95,10 @@ impl Workspace {
             .resolve
             .context("no dependency resolution in metadata")?;
         let workspace_members: HashSet<_> = metadata.workspace_members.iter().collect();
+
+        // Build a single index of all OUT_DIRs once, rather than re-scanning
+        // `target/*/build/*` for every crate (O(N²) → O(N)).
+        let out_dir_map = build_out_dir_map(metadata.target_directory.as_std_path());
 
         let mut crates = Vec::new();
         for node in &resolve.nodes {
@@ -98,7 +124,7 @@ impl Workspace {
                         source_dirs.push(tests_dir);
                     }
                 }
-                let out_dir = find_out_dir(metadata.target_directory.as_std_path(), &pkg.name);
+                let out_dir = out_dir_map.get(pkg.name.as_str()).map(|(p, _)| p.clone());
                 let deps: Vec<String> = node
                     .deps
                     .iter()
@@ -159,5 +185,72 @@ impl Workspace {
             .filter(|&m| m != crate_name && !dep_set.contains(&normalize(m)))
             .map(|m| m.to_string())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_hash_suffix_recognizes_cargo_build_dir_name() {
+        assert_eq!(strip_hash_suffix("libc-0c691b6f9963e146"), Some("libc"));
+        assert_eq!(
+            strip_hash_suffix("async-trait-0abc123456789def"),
+            Some("async-trait")
+        );
+        assert_eq!(
+            strip_hash_suffix("aws-sdk-eks-0123456789abcdef"),
+            Some("aws-sdk-eks")
+        );
+    }
+
+    #[test]
+    fn strip_hash_suffix_rejects_non_hash_suffix() {
+        // Wrong length
+        assert_eq!(strip_hash_suffix("libc-0c691b6f9963e14"), None);
+        // Non-hex
+        assert_eq!(strip_hash_suffix("libc-0c691b6fzzzzz146"), None);
+        // No hyphen
+        assert_eq!(strip_hash_suffix("libc"), None);
+    }
+
+    #[test]
+    fn build_out_dir_map_collects_crates_across_profiles_and_picks_newest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path();
+
+        // Two profiles, same crate name with different mtimes.
+        let older = target
+            .join("debug")
+            .join("build")
+            .join("mycrate-1111111111111111")
+            .join("out");
+        std::fs::create_dir_all(&older).unwrap();
+        // Sleep to ensure distinct mtimes on fast filesystems.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let newer = target
+            .join("release")
+            .join("build")
+            .join("mycrate-2222222222222222")
+            .join("out");
+        std::fs::create_dir_all(&newer).unwrap();
+
+        // An entry without an `out` subdir must be ignored.
+        std::fs::create_dir_all(
+            target
+                .join("debug")
+                .join("build")
+                .join("nooutcrate-3333333333333333"),
+        )
+        .unwrap();
+
+        let map = build_out_dir_map(target);
+        assert_eq!(
+            map.get("mycrate").map(|(p, _)| p.clone()),
+            Some(newer),
+            "expected the newer profile to win"
+        );
+        assert!(!map.contains_key("nooutcrate"));
     }
 }
