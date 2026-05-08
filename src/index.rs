@@ -53,7 +53,10 @@ pub fn index_crate(
     pub_only: bool,
     out_dir: Option<&Path>,
 ) -> Result<Vec<IndexEntry>> {
-    let macro_cfgs = prescan_macro_cfgs(dirs);
+    let (macro_cfgs, has_item) = prescan_macro_cfgs_and_check(dirs, Some(item_name));
+    if !has_item {
+        return Ok(vec![]);
+    }
     let opts = CollectOpts {
         name_filter: Some(item_name),
         pub_only,
@@ -77,7 +80,7 @@ pub fn index_crate_full_parse(
     pub_only: bool,
     out_dir: Option<&Path>,
 ) -> Result<Vec<IndexEntry>> {
-    let macro_cfgs = prescan_macro_cfgs(dirs);
+    let (macro_cfgs, _) = prescan_macro_cfgs_and_check(dirs, None);
     let opts = CollectOpts {
         name_filter: Some(item_name),
         pub_only,
@@ -99,7 +102,7 @@ pub fn list_items(
     pub_only: bool,
     out_dir: Option<&Path>,
 ) -> Result<Vec<IndexEntry>> {
-    let macro_cfgs = prescan_macro_cfgs(dirs);
+    let (macro_cfgs, _) = prescan_macro_cfgs_and_check(dirs, None);
     let opts = CollectOpts {
         name_filter: None,
         pub_only,
@@ -650,14 +653,21 @@ fn walk_all_rs(
 type MacroCfgMap = std::collections::HashMap<String, Vec<String>>;
 
 /// Pre-scan all `.rs` files under `dirs` for `macro_rules!` cfg-gating definitions.
-fn prescan_macro_cfgs(dirs: &[PathBuf]) -> MacroCfgMap {
+/// Also checks whether any file contains `item_name` (when provided).
+/// Returns `(macro_cfg_map, has_item_text)`.
+fn prescan_macro_cfgs_and_check(dirs: &[PathBuf], item_name: Option<&str>) -> (MacroCfgMap, bool) {
     let mut map = MacroCfgMap::new();
+    let mut has_item = item_name.is_none(); // if no filter, always "has item"
     for dir in dirs {
         for path in gather_rs_files(dir) {
             let Ok(source) = fs::read_to_string(&path) else {
                 continue;
             };
-            // Quick text check: skip files that don't contain macro_rules
+            if let Some(name) = item_name {
+                if !has_item && source.contains(name) {
+                    has_item = true;
+                }
+            }
             if !source.contains("macro_rules") {
                 continue;
             }
@@ -667,7 +677,7 @@ fn prescan_macro_cfgs(dirs: &[PathBuf]) -> MacroCfgMap {
             map.extend(collect_macro_cfg_defs(&file));
         }
     }
-    map
+    (map, has_item)
 }
 
 struct ItemVisitor<'a> {
