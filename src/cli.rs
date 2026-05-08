@@ -411,40 +411,16 @@ fn search_crates_for<'a>(
     item_name: &str,
     query: &query::Query,
 ) -> std::result::Result<Vec<(&'a ResolvedCrate, IndexEntry)>, NotFound> {
-    let results: Vec<Result<Vec<(&ResolvedCrate, IndexEntry)>, _>> = crates
-        .par_iter()
-        .map(|c| {
-            let entries = index::index_crate(
-                &c.source_dirs,
-                item_name,
-                !c.is_workspace_member,
-                c.out_dir.as_deref(),
-            )
-            .map_err(|e| NotFound {
-                message: e.to_string(),
-                suggestions: vec![],
-            })?;
-            Ok(entries
-                .into_iter()
-                .filter(|entry| query.matches_module_path(&entry.module_path))
-                .map(|entry| (*c, entry))
-                .collect())
-        })
-        .collect();
-    let mut matches = Vec::new();
-    for r in results {
-        matches.extend(r?);
-    }
-    // Global fallback: if text-filtered pass found nothing, retry with full parse
-    if matches.is_empty() {
+    let do_pass = |use_text_filter: bool| -> std::result::Result<Vec<_>, NotFound> {
         let results: Vec<Result<Vec<(&ResolvedCrate, IndexEntry)>, _>> = crates
             .par_iter()
             .map(|c| {
-                let entries = index::index_crate_full_parse(
+                let entries = index::index_crate(
                     &c.source_dirs,
                     item_name,
                     !c.is_workspace_member,
                     c.out_dir.as_deref(),
+                    use_text_filter,
                 )
                 .map_err(|e| NotFound {
                     message: e.to_string(),
@@ -457,11 +433,21 @@ fn search_crates_for<'a>(
                     .collect())
             })
             .collect();
+        let mut matches = Vec::new();
         for r in results {
             matches.extend(r?);
         }
+        Ok(matches)
+    };
+
+    let matches = do_pass(true)?;
+    // Global fallback: if the text-filtered pass found nothing, retry with
+    // full parse to catch items hidden in macro bodies.
+    if matches.is_empty() {
+        do_pass(false)
+    } else {
+        Ok(matches)
     }
-    Ok(matches)
 }
 
 fn run_item_search(

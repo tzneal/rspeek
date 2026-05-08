@@ -44,48 +44,126 @@ struct CollectOpts<'a> {
     macro_cfgs: MacroCfgMap,
 }
 
+const RSPEEK_INDEX_FILE: &str = ".rspeek-index";
+
+/// Read cached item names from a `.rspeek-index` file.
+fn read_name_index(dir: &Path) -> Option<Vec<String>> {
+    let path = dir.join(RSPEEK_INDEX_FILE);
+    let content = fs::read_to_string(&path).ok()?;
+    Some(content.lines().map(String::from).collect())
+}
+
+/// Write item names to a `.rspeek-index` file. Best-effort.
+fn write_name_index(dir: &Path, names: &[String]) {
+    let path = dir.join(RSPEEK_INDEX_FILE);
+    let _ = fs::write(&path, names.join("\n"));
+}
+
+/// Check if a path is inside a cargo registry (immutable dep source).
+fn is_registry_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    s.contains("/registry/src/") || s.contains("/.cargo/registry/")
+}
+
+/// Extract public item names from source text using cheap pattern matching.
+/// Not a full parse — just looks for `pub (struct|enum|trait|fn|type|const|static|union) Name`.
+fn extract_item_names_from_source(source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let rest = if let Some(r) = trimmed.strip_prefix("pub ") {
+            r
+        } else if trimmed.starts_with("pub(") {
+            // pub(crate), pub(super), etc — still extract the name
+            match trimmed.find(')') {
+                Some(i) => trimmed[i + 1..].trim_start(),
+                None => continue,
+            }
+        } else {
+            continue;
+        };
+        let name = extract_name_after_keyword(rest);
+        if let Some(n) = name {
+            if n.starts_with(|c: char| c.is_alphabetic()) {
+                names.push(n.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Given text after `pub `, try to extract an item name.
+fn extract_name_after_keyword(s: &str) -> Option<&str> {
+    let keywords = [
+        "struct ", "enum ", "trait ", "fn ", "type ", "const ", "static ", "union ", "macro ",
+    ];
+    for kw in &keywords {
+        if let Some(rest) = s.strip_prefix(kw) {
+            let rest = rest.trim_start();
+            let end = rest
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(rest.len());
+            if end > 0 {
+                return Some(&rest[..end]);
+            }
+        }
+    }
+    // Handle `pub async fn`
+    if let Some(rest) = s.strip_prefix("async fn ") {
+        let rest = rest.trim_start();
+        let end = rest
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
+        if end > 0 {
+            return Some(&rest[..end]);
+        }
+    }
+    // Handle `pub unsafe fn`, `pub const fn`, `pub unsafe trait`
+    for prefix in ["unsafe ", "const "] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            return extract_name_after_keyword(rest);
+        }
+    }
+    None
+}
+
 /// Build an index of items under `dirs` matching `item_name`.
-/// Uses a fast text pre-filter: only parses files containing `item_name`.
-/// Does NOT fall back to full parse — caller is responsible for fallback.
+///
+/// When `use_text_filter` is true, only files containing `item_name` are
+/// parsed and only crates with at least one textual occurrence are visited —
+/// the fast path used in the common case. When false, every `.rs` file is
+/// parsed; use this as a fallback to catch items hidden inside macro bodies
+/// that the text scan wouldn't reveal.
 pub fn index_crate(
     dirs: &[PathBuf],
     item_name: &str,
     pub_only: bool,
     out_dir: Option<&Path>,
+    use_text_filter: bool,
 ) -> Result<Vec<IndexEntry>> {
-    let (macro_cfgs, has_item) = prescan_macro_cfgs_and_check(dirs, Some(item_name));
-    if !has_item {
+    // Fast path: consult the cached name index before doing any work.
+    // Only meaningful when text-filtering (the index is populated from text
+    // scans and would falsely rule out macro-body items otherwise).
+    if use_text_filter && pub_only {
+        if let Some(dir) = dirs.first() {
+            if let Some(names) = read_name_index(dir) {
+                if !names.iter().any(|n| n == item_name) {
+                    return Ok(vec![]);
+                }
+            }
+        }
+    }
+
+    let scan_for = use_text_filter.then_some(item_name);
+    let (macro_cfgs, has_item) = prescan_macro_cfgs_and_check(dirs, scan_for);
+    if use_text_filter && !has_item {
         return Ok(vec![]);
     }
     let opts = CollectOpts {
         name_filter: Some(item_name),
         pub_only,
         out_dir,
-        text_filter: Some(item_name),
-        inherited_cfg: Vec::new(),
-        macro_cfgs,
-    };
-    let mut entries = Vec::new();
-    for dir in dirs {
-        entries.extend(collect(dir, opts.clone())?);
-    }
-    Ok(entries)
-}
-
-/// Like `index_crate` but without the text pre-filter (full parse).
-/// Use this as a fallback when the text-filtered pass finds nothing globally.
-pub fn index_crate_full_parse(
-    dirs: &[PathBuf],
-    item_name: &str,
-    pub_only: bool,
-    out_dir: Option<&Path>,
-) -> Result<Vec<IndexEntry>> {
-    let (macro_cfgs, _) = prescan_macro_cfgs_and_check(dirs, None);
-    let opts = CollectOpts {
-        name_filter: Some(item_name),
-        pub_only,
-        out_dir,
-        text_filter: None,
+        text_filter: scan_for,
         inherited_cfg: Vec::new(),
         macro_cfgs,
     };
@@ -97,6 +175,7 @@ pub fn index_crate_full_parse(
 }
 
 /// List all items under `dirs`. If `pub_only` is true, only public items.
+/// Writes a `.rspeek-index` cache for dependency crates (pub_only=true).
 pub fn list_items(
     dirs: &[PathBuf],
     pub_only: bool,
@@ -114,6 +193,15 @@ pub fn list_items(
     let mut entries = Vec::new();
     for dir in dirs {
         entries.extend(collect(dir, opts.clone())?);
+    }
+    // Write name index for dep crates
+    if pub_only {
+        if let Some(dir) = dirs.first() {
+            if is_registry_path(dir) {
+                let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+                write_name_index(dir, &names);
+            }
+        }
     }
     Ok(entries)
 }
@@ -655,29 +743,61 @@ type MacroCfgMap = std::collections::HashMap<String, Vec<String>>;
 /// Pre-scan all `.rs` files under `dirs` for `macro_rules!` cfg-gating definitions.
 /// Also checks whether any file contains `item_name` (when provided).
 /// Returns `(macro_cfg_map, has_item_text)`.
+///
+/// Opportunistically writes a `.rspeek-index` if one doesn't exist yet,
+/// since we're already reading every file.
 fn prescan_macro_cfgs_and_check(dirs: &[PathBuf], item_name: Option<&str>) -> (MacroCfgMap, bool) {
+    let files: Vec<PathBuf> = dirs.iter().flat_map(|d| gather_rs_files(d)).collect();
+
+    // Check if we should write a name index (only for dirs that don't have one yet
+    // and appear to be in a cargo registry — i.e. immutable dep crates)
+    let should_write_index = dirs
+        .first()
+        .is_some_and(|d| !d.join(RSPEEK_INDEX_FILE).exists() && is_registry_path(d));
+
+    // First pass: read files, check for item name, collect names for index
+    let mut has_item = item_name.is_none();
+    let mut all_names: Vec<String> = Vec::new();
+    let mut macro_files: Vec<(PathBuf, String)> = Vec::new();
+
+    for path in &files {
+        let Ok(source) = fs::read_to_string(path) else {
+            continue;
+        };
+        if let Some(name) = item_name {
+            if !has_item && source.contains(name) {
+                has_item = true;
+            }
+        }
+        if should_write_index {
+            all_names.extend(extract_item_names_from_source(&source));
+        }
+        if source.contains("macro_rules") {
+            macro_files.push((path.clone(), source));
+        }
+    }
+
+    // Write name index if we collected names
+    if should_write_index {
+        if let Some(dir) = dirs.first() {
+            all_names.sort();
+            all_names.dedup();
+            write_name_index(dir, &all_names);
+        }
+    }
+
+    if !has_item {
+        return (MacroCfgMap::new(), false);
+    }
+
+    // Build macro cfg map
     let mut map = MacroCfgMap::new();
-    let mut has_item = item_name.is_none(); // if no filter, always "has item"
-    for dir in dirs {
-        for path in gather_rs_files(dir) {
-            let Ok(source) = fs::read_to_string(&path) else {
-                continue;
-            };
-            if let Some(name) = item_name {
-                if !has_item && source.contains(name) {
-                    has_item = true;
-                }
-            }
-            if !source.contains("macro_rules") {
-                continue;
-            }
-            let Ok(file) = syn::parse_file(&source) else {
-                continue;
-            };
+    for (_, source) in &macro_files {
+        if let Ok(file) = syn::parse_file(source) {
             map.extend(collect_macro_cfg_defs(&file));
         }
     }
-    (map, has_item)
+    (map, true)
 }
 
 struct ItemVisitor<'a> {
@@ -1144,7 +1264,7 @@ mod tests {
         // lib.rs: public struct + private mod with pub(crate) struct of same name
         fs::write(src.join("lib.rs"), "pub struct Chain;\nmod inner;").unwrap();
         fs::write(src.join("inner.rs"), "pub(crate) struct Chain;").unwrap();
-        let entries = index_crate(&[src], "Chain", true, None).unwrap();
+        let entries = index_crate(&[src], "Chain", true, None, true).unwrap();
         assert_eq!(
             entries.len(),
             1,
@@ -1165,7 +1285,7 @@ mod tests {
         fs::write(src.join("lib.rs"), "pub mod a;\npub(crate) mod b;").unwrap();
         fs::write(src.join("a.rs"), "pub struct Foo;").unwrap();
         fs::write(src.join("b.rs"), "pub struct Foo;").unwrap();
-        let entries = index_crate(&[src], "Foo", false, None).unwrap();
+        let entries = index_crate(&[src], "Foo", false, None, true).unwrap();
         assert_eq!(
             entries.len(),
             2,
@@ -1396,7 +1516,7 @@ cfg_net_unix! {
 
         // Filtered-search path: index_crate with the fast text pre-filter.
         // This exercises the `mod <name>;` line-scan fallback in index_file.
-        let filtered = index_crate(std::slice::from_ref(&src), "Inner", true, None).unwrap();
+        let filtered = index_crate(std::slice::from_ref(&src), "Inner", true, None, true).unwrap();
         assert!(
             filtered
                 .iter()
@@ -1454,7 +1574,7 @@ cfg_net_unix! {
         );
 
         // Fast-path text scanner should also follow #[path].
-        let filtered = index_crate(std::slice::from_ref(&src), "Custom", true, None).unwrap();
+        let filtered = index_crate(std::slice::from_ref(&src), "Custom", true, None, true).unwrap();
         assert!(
             filtered
                 .iter()
@@ -1543,5 +1663,45 @@ pub mod imp;
                 )
             });
         assert_eq!(nested.module_path, "foo::outer::bar");
+    }
+
+    #[test]
+    fn extract_item_names_finds_common_patterns() {
+        let source = r#"
+pub struct Foo;
+pub enum Bar {}
+pub trait Baz {}
+pub fn quux() {}
+pub type Alias = u32;
+pub const MAX: u32 = 10;
+pub static GLOBAL: &str = "hi";
+pub union MyUnion { f1: u32 }
+pub async fn async_fn() {}
+pub unsafe fn unsafe_fn() {}
+pub(crate) struct Internal;
+struct Private;
+"#;
+        let names = extract_item_names_from_source(source);
+        assert!(names.contains(&"Foo".to_string()));
+        assert!(names.contains(&"Bar".to_string()));
+        assert!(names.contains(&"Baz".to_string()));
+        assert!(names.contains(&"quux".to_string()));
+        assert!(names.contains(&"Alias".to_string()));
+        assert!(names.contains(&"MAX".to_string()));
+        assert!(names.contains(&"GLOBAL".to_string()));
+        assert!(names.contains(&"MyUnion".to_string()));
+        assert!(names.contains(&"async_fn".to_string()));
+        assert!(names.contains(&"unsafe_fn".to_string()));
+        assert!(names.contains(&"Internal".to_string()));
+        assert!(!names.contains(&"Private".to_string()));
+    }
+
+    #[test]
+    fn name_index_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = vec!["Foo".to_string(), "Bar".to_string(), "Baz".to_string()];
+        write_name_index(dir.path(), &names);
+        let loaded = read_name_index(dir.path()).unwrap();
+        assert_eq!(loaded, names);
     }
 }
