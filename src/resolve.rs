@@ -85,6 +85,42 @@ pub struct Workspace {
     pub crates: Vec<ResolvedCrate>,
 }
 
+/// Build a `ResolvedCrate` for a cargo-metadata package, if it has a `src/`
+/// directory. Returns `Ok(None)` if the package has no source directory
+/// (virtual packages, etc.).
+fn build_resolved_crate(
+    pkg: &cargo_metadata::Package,
+    is_member: bool,
+    deps: Vec<String>,
+    out_dir_map: &std::collections::HashMap<String, (PathBuf, std::time::SystemTime)>,
+) -> Result<Option<ResolvedCrate>> {
+    let manifest_dir = pkg
+        .manifest_path
+        .parent()
+        .context("manifest has no parent dir")?;
+    let manifest_std = manifest_dir.as_std_path();
+    let src_dir = PathBuf::from(manifest_std).join("src");
+    if !src_dir.is_dir() {
+        return Ok(None);
+    }
+    let mut source_dirs = vec![src_dir];
+    if is_member {
+        let tests_dir = PathBuf::from(manifest_std).join("tests");
+        if tests_dir.is_dir() {
+            source_dirs.push(tests_dir);
+        }
+    }
+    let out_dir = out_dir_map.get(pkg.name.as_str()).map(|(p, _)| p.clone());
+    Ok(Some(ResolvedCrate {
+        name: pkg.name.to_string(),
+        version: pkg.version.to_string(),
+        source_dirs,
+        is_workspace_member: is_member,
+        out_dir,
+        deps,
+    }))
+}
+
 impl Workspace {
     pub fn load() -> Result<Self> {
         let metadata = MetadataCommand::new().exec().context(
@@ -107,42 +143,61 @@ impl Workspace {
                 .iter()
                 .find(|p| p.id == node.id)
                 .context("package not found in metadata")?;
+            let is_member = workspace_members.contains(&node.id);
+            let deps: Vec<String> = node
+                .deps
+                .iter()
+                .filter(|d| {
+                    d.dep_kinds
+                        .iter()
+                        .any(|k| k.kind == cargo_metadata::DependencyKind::Normal)
+                })
+                .map(|d| d.name.clone())
+                .collect();
+            if let Some(c) = build_resolved_crate(pkg, is_member, deps, &out_dir_map)? {
+                crates.push(c);
+            }
+        }
 
-            let manifest_dir = pkg
-                .manifest_path
-                .parent()
-                .context("manifest has no parent dir")?;
+        if crates.is_empty() {
+            bail!("no crates found");
+        }
 
-            let manifest_std = manifest_dir.as_std_path();
-            let src_dir = PathBuf::from(manifest_std).join("src");
-            if src_dir.is_dir() {
-                let is_member = workspace_members.contains(&node.id);
-                let mut source_dirs = vec![src_dir];
-                if is_member {
-                    let tests_dir = PathBuf::from(manifest_std).join("tests");
-                    if tests_dir.is_dir() {
-                        source_dirs.push(tests_dir);
-                    }
-                }
-                let out_dir = out_dir_map.get(pkg.name.as_str()).map(|(p, _)| p.clone());
-                let deps: Vec<String> = node
-                    .deps
-                    .iter()
-                    .filter(|d| {
-                        d.dep_kinds
-                            .iter()
-                            .any(|k| k.kind == cargo_metadata::DependencyKind::Normal)
-                    })
-                    .map(|d| d.name.clone())
-                    .collect();
-                crates.push(ResolvedCrate {
-                    name: pkg.name.to_string(),
-                    version: pkg.version.to_string(),
-                    source_dirs,
-                    is_workspace_member: is_member,
-                    out_dir,
-                    deps,
-                });
+        Ok(Workspace { crates })
+    }
+
+    /// Load only the workspace members via `cargo metadata --no-deps`.
+    ///
+    /// This is much faster than `load()` (typically ~20× on large workspaces)
+    /// because cargo skips dependency resolution entirely. Use this for the
+    /// "fast path": queries that can be resolved against workspace members
+    /// alone (e.g. a bare-name item search that hits a local symbol, or a
+    /// crate-scoped query targeting a workspace member). Fall back to
+    /// `load()` when the query references a dependency crate or misses in
+    /// members.
+    pub fn load_members_only() -> Result<Self> {
+        let metadata = MetadataCommand::new().no_deps().exec().context(
+            "failed to run `cargo metadata --no-deps` — is there a Cargo.toml in the current directory?",
+        )?;
+
+        let out_dir_map = build_out_dir_map(metadata.target_directory.as_std_path());
+        let member_ids: HashSet<_> = metadata.workspace_members.iter().collect();
+
+        let mut crates = Vec::new();
+        for pkg in &metadata.packages {
+            if !member_ids.contains(&pkg.id) {
+                continue;
+            }
+            // With `--no-deps`, resolved graph isn't available, so read the
+            // manifest's declared normal dependencies instead.
+            let deps: Vec<String> = pkg
+                .dependencies
+                .iter()
+                .filter(|d| d.kind == cargo_metadata::DependencyKind::Normal)
+                .map(|d| d.name.clone())
+                .collect();
+            if let Some(c) = build_resolved_crate(pkg, true, deps, &out_dir_map)? {
+                crates.push(c);
             }
         }
 

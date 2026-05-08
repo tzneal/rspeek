@@ -155,18 +155,51 @@ pub fn run(cli: &Cli, out: &mut Output) -> std::result::Result<(), NotFound> {
         suggestions: vec![],
     })?;
 
+    // Phase 1: try to resolve using workspace members only (cargo metadata
+    // --no-deps, ~20× faster than full). Skip phase 1 if the query references
+    // a crate name that isn't a workspace member, since it can't succeed.
+    let members = resolve::Workspace::load_members_only().map_err(|e| NotFound {
+        message: e.to_string(),
+        suggestions: vec![],
+    })?;
+    let query = query::Query::parse(first, cli.second.as_deref(), &members);
+    let can_try_phase1 = query
+        .crate_filter()
+        .is_none_or(|name| members.has_crate(name));
+
+    if can_try_phase1 {
+        let mut buf = Output::default();
+        if dispatch(cli, &members, &query, &mut buf).is_ok() {
+            out.stdout.push_str(&buf.stdout);
+            out.stderr.push_str(&buf.stderr);
+            return Ok(());
+        }
+        // Phase 1 error is swallowed; phase 2 retries with full metadata.
+    }
+
+    // Phase 2: full metadata, re-parse query (so a bare `rspeek anyhow`
+    // reclassifies from Unscoped to CrateOnly once deps are known), and
+    // dispatch.
     let ws = resolve::Workspace::load().map_err(|e| NotFound {
         message: e.to_string(),
         suggestions: vec![],
     })?;
     let query = query::Query::parse(first, cli.second.as_deref(), &ws);
+    dispatch(cli, &ws, &query, out)
+}
 
-    // Handle crate-only query: show overview
-    if let query::Query::CrateOnly { crate_name } = &query {
-        return run_crate_overview(cli, &ws, crate_name, out);
+/// Dispatch a parsed query to either the crate-overview or item-search path.
+fn dispatch(
+    cli: &Cli,
+    ws: &resolve::Workspace,
+    query: &query::Query,
+    out: &mut Output,
+) -> std::result::Result<(), NotFound> {
+    if let query::Query::CrateOnly { crate_name } = query {
+        run_crate_overview(cli, ws, crate_name, out)
+    } else {
+        run_item_search(cli, ws, query, out)
     }
-
-    run_item_search(cli, &ws, &query, out)
 }
 
 fn run_crate_overview(
