@@ -369,6 +369,40 @@ fn cross_crate_redirect(
     None
 }
 
+/// Run `index_crate` in parallel across the given crates, filtering entries by
+/// the query's module path, and collecting the results.
+fn search_crates_for<'a>(
+    crates: &[&'a ResolvedCrate],
+    item_name: &str,
+    query: &query::Query,
+) -> std::result::Result<Vec<(&'a ResolvedCrate, IndexEntry)>, NotFound> {
+    let results: Vec<Result<Vec<(&ResolvedCrate, IndexEntry)>, _>> = crates
+        .par_iter()
+        .map(|c| {
+            let entries = index::index_crate(
+                &c.source_dirs,
+                item_name,
+                !c.is_workspace_member,
+                c.out_dir.as_deref(),
+            )
+            .map_err(|e| NotFound {
+                message: e.to_string(),
+                suggestions: vec![],
+            })?;
+            Ok(entries
+                .into_iter()
+                .filter(|entry| query.matches_module_path(&entry.module_path))
+                .map(|entry| (*c, entry))
+                .collect())
+        })
+        .collect();
+    let mut matches = Vec::new();
+    for r in results {
+        matches.extend(r?);
+    }
+    Ok(matches)
+}
+
 fn run_item_search(
     cli: &Cli,
     ws: &resolve::Workspace,
@@ -407,29 +441,23 @@ fn run_item_search(
         None => ws.crates.iter().collect(),
     };
 
-    let results: Vec<Result<Vec<(&ResolvedCrate, IndexEntry)>, _>> = search_crates
-        .par_iter()
-        .map(|c| {
-            let entries = index::index_crate(
-                &c.source_dirs,
-                item_name,
-                !c.is_workspace_member,
-                c.out_dir.as_deref(),
-            )
-            .map_err(|e| NotFound {
-                message: e.to_string(),
-                suggestions: vec![],
-            })?;
-            Ok(entries
-                .into_iter()
-                .filter(|entry| query.matches_module_path(&entry.module_path))
-                .map(|entry| (*c, entry))
-                .collect())
-        })
-        .collect();
-    let mut matches: Vec<(&ResolvedCrate, IndexEntry)> = Vec::new();
-    for r in results {
-        matches.extend(r?);
+    // Workspace-first strategy for bare-name queries: search workspace members
+    // first and only fall through to dependency crates if no match is found.
+    // This skips the expensive dep scan for local symbols (the common case
+    // when an LLM is inspecting user code).
+    let (initial, fallback): (Vec<&ResolvedCrate>, Vec<&ResolvedCrate>) =
+        if query.crate_filter().is_none() {
+            search_crates
+                .iter()
+                .copied()
+                .partition(|c| c.is_workspace_member)
+        } else {
+            (search_crates.clone(), Vec::new())
+        };
+
+    let mut matches = search_crates_for(&initial, item_name, query)?;
+    if matches.is_empty() && !fallback.is_empty() {
+        matches = search_crates_for(&fallback, item_name, query)?;
     }
 
     // Deduplicate entries pointing to the same source location, keeping the
@@ -737,6 +765,119 @@ mod tests {
         assert!(
             out.stdout.contains("aliased_fn"),
             "output should contain aliased_fn: {}",
+            out.stdout
+        );
+    }
+
+    /// For a bare-name query (no crate filter), a symbol in a workspace member
+    /// should be returned even when a dep also defines the same symbol, and the
+    /// dep version should not appear in the output.
+    #[test]
+    fn bare_name_query_prefers_workspace_over_dep() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Workspace member defines `Target` as a struct.
+        let member_src = dir.path().join("member_src");
+        fs::create_dir_all(&member_src).unwrap();
+        fs::write(member_src.join("lib.rs"), "pub struct Target;").unwrap();
+
+        // Dep also defines `Target` as a struct.
+        let dep_src = dir.path().join("dep_src");
+        fs::create_dir_all(&dep_src).unwrap();
+        fs::write(dep_src.join("lib.rs"), "pub struct Target;").unwrap();
+
+        let ws = resolve::Workspace {
+            crates: vec![
+                resolve::ResolvedCrate {
+                    name: "my_member".to_string(),
+                    version: "0.1.0".to_string(),
+                    source_dirs: vec![member_src.clone()],
+                    is_workspace_member: true,
+                    out_dir: None,
+                    deps: vec![],
+                },
+                resolve::ResolvedCrate {
+                    name: "some_dep".to_string(),
+                    version: "1.0.0".to_string(),
+                    source_dirs: vec![dep_src.clone()],
+                    is_workspace_member: false,
+                    out_dir: None,
+                    deps: vec![],
+                },
+            ],
+        };
+
+        let query = query::Query::parse("Target", None, &ws);
+        let cli = Cli::parse_from(["rspeek", "Target"]);
+        let mut out = Output::default();
+        let result = run_item_search(&cli, &ws, &query, &mut out);
+        assert!(
+            result.is_ok(),
+            "expected match, got: {:?}",
+            result.err().map(|e| e.message)
+        );
+        // The workspace version must be present and the dep version must NOT appear.
+        assert!(
+            out.stdout.contains("my_member"),
+            "workspace match should appear in output: {}",
+            out.stdout
+        );
+        assert!(
+            !out.stdout.contains("some_dep"),
+            "dep match should NOT appear when workspace match exists: {}",
+            out.stdout
+        );
+    }
+
+    /// For a bare-name query, if no workspace member defines the symbol, the
+    /// search should fall through to deps and find the symbol there.
+    #[test]
+    fn bare_name_query_falls_back_to_dep_when_not_in_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Workspace member has unrelated content.
+        let member_src = dir.path().join("member_src");
+        fs::create_dir_all(&member_src).unwrap();
+        fs::write(member_src.join("lib.rs"), "pub struct SomethingElse;").unwrap();
+
+        // Only the dep defines `DepOnly`.
+        let dep_src = dir.path().join("dep_src");
+        fs::create_dir_all(&dep_src).unwrap();
+        fs::write(dep_src.join("lib.rs"), "pub struct DepOnly;").unwrap();
+
+        let ws = resolve::Workspace {
+            crates: vec![
+                resolve::ResolvedCrate {
+                    name: "my_member".to_string(),
+                    version: "0.1.0".to_string(),
+                    source_dirs: vec![member_src],
+                    is_workspace_member: true,
+                    out_dir: None,
+                    deps: vec![],
+                },
+                resolve::ResolvedCrate {
+                    name: "some_dep".to_string(),
+                    version: "1.0.0".to_string(),
+                    source_dirs: vec![dep_src],
+                    is_workspace_member: false,
+                    out_dir: None,
+                    deps: vec![],
+                },
+            ],
+        };
+
+        let query = query::Query::parse("DepOnly", None, &ws);
+        let cli = Cli::parse_from(["rspeek", "DepOnly"]);
+        let mut out = Output::default();
+        let result = run_item_search(&cli, &ws, &query, &mut out);
+        assert!(
+            result.is_ok(),
+            "expected fallback to find dep match, got: {:?}",
+            result.err().map(|e| e.message)
+        );
+        assert!(
+            out.stdout.contains("DepOnly"),
+            "output should contain DepOnly from dep: {}",
             out.stdout
         );
     }
