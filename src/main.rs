@@ -11,6 +11,7 @@ fn main() {
         cli.signature = true;
         cli.impls = true;
     }
+    rspeek::cache::prune();
     match rspeek::run(&cli) {
         Ok(out) => {
             eprint!("{}", out.stderr);

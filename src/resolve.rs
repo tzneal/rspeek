@@ -85,6 +85,19 @@ pub struct Workspace {
     pub crates: Vec<ResolvedCrate>,
 }
 
+/// Find the directory containing the nearest Cargo.toml (walking up from CWD).
+fn find_manifest_dir() -> Result<PathBuf> {
+    let mut dir = std::env::current_dir().context("cannot determine current directory")?;
+    loop {
+        if dir.join("Cargo.toml").exists() {
+            return Ok(dir);
+        }
+        if !dir.pop() {
+            bail!("no Cargo.toml found in any parent directory");
+        }
+    }
+}
+
 /// Build a `ResolvedCrate` for a cargo-metadata package, if it has a `src/`
 /// directory. Returns `Ok(None)` if the package has no source directory
 /// (virtual packages, etc.).
@@ -123,47 +136,7 @@ fn build_resolved_crate(
 
 impl Workspace {
     pub fn load() -> Result<Self> {
-        let metadata = MetadataCommand::new().exec().context(
-            "failed to run `cargo metadata` — is there a Cargo.toml in the current directory?",
-        )?;
-
-        let resolve = metadata
-            .resolve
-            .context("no dependency resolution in metadata")?;
-        let workspace_members: HashSet<_> = metadata.workspace_members.iter().collect();
-
-        // Build a single index of all OUT_DIRs once, rather than re-scanning
-        // `target/*/build/*` for every crate (O(N²) → O(N)).
-        let out_dir_map = build_out_dir_map(metadata.target_directory.as_std_path());
-
-        let mut crates = Vec::new();
-        for node in &resolve.nodes {
-            let pkg = metadata
-                .packages
-                .iter()
-                .find(|p| p.id == node.id)
-                .context("package not found in metadata")?;
-            let is_member = workspace_members.contains(&node.id);
-            let deps: Vec<String> = node
-                .deps
-                .iter()
-                .filter(|d| {
-                    d.dep_kinds
-                        .iter()
-                        .any(|k| k.kind == cargo_metadata::DependencyKind::Normal)
-                })
-                .map(|d| d.name.clone())
-                .collect();
-            if let Some(c) = build_resolved_crate(pkg, is_member, deps, &out_dir_map)? {
-                crates.push(c);
-            }
-        }
-
-        if crates.is_empty() {
-            bail!("no crates found");
-        }
-
-        Ok(Workspace { crates })
+        Self::load_cached(false)
     }
 
     /// Load only the workspace members via `cargo metadata --no-deps`.
@@ -176,28 +149,78 @@ impl Workspace {
     /// `load()` when the query references a dependency crate or misses in
     /// members.
     pub fn load_members_only() -> Result<Self> {
-        let metadata = MetadataCommand::new().no_deps().exec().context(
-            "failed to run `cargo metadata --no-deps` — is there a Cargo.toml in the current directory?",
-        )?;
+        Self::load_cached(true)
+    }
 
+    fn load_cached(no_deps: bool) -> Result<Self> {
+        let manifest_dir = find_manifest_dir()?;
+        if let Some(metadata) = crate::cache::load(&manifest_dir, no_deps) {
+            return Self::from_metadata(metadata, no_deps);
+        }
+        let mut cmd = MetadataCommand::new();
+        if no_deps {
+            cmd.no_deps();
+        }
+        let ctx = if no_deps {
+            "failed to run `cargo metadata --no-deps` — is there a Cargo.toml in the current directory?"
+        } else {
+            "failed to run `cargo metadata` — is there a Cargo.toml in the current directory?"
+        };
+        let metadata = cmd.exec().context(ctx)?;
+        crate::cache::save(&manifest_dir, no_deps, &metadata);
+        Self::from_metadata(metadata, no_deps)
+    }
+
+    fn from_metadata(metadata: cargo_metadata::Metadata, no_deps: bool) -> Result<Self> {
+        // Build a single index of all OUT_DIRs once, rather than re-scanning
+        // `target/*/build/*` for every crate (O(N²) → O(N)).
         let out_dir_map = build_out_dir_map(metadata.target_directory.as_std_path());
         let member_ids: HashSet<_> = metadata.workspace_members.iter().collect();
 
         let mut crates = Vec::new();
-        for pkg in &metadata.packages {
-            if !member_ids.contains(&pkg.id) {
-                continue;
+        if no_deps {
+            // Workspace members only; deps come straight from each package manifest.
+            for pkg in &metadata.packages {
+                if !member_ids.contains(&pkg.id) {
+                    continue;
+                }
+                let deps: Vec<String> = pkg
+                    .dependencies
+                    .iter()
+                    .filter(|d| d.kind == cargo_metadata::DependencyKind::Normal)
+                    .map(|d| d.name.clone())
+                    .collect();
+                if let Some(c) = build_resolved_crate(pkg, true, deps, &out_dir_map)? {
+                    crates.push(c);
+                }
             }
-            // With `--no-deps`, resolved graph isn't available, so read the
-            // manifest's declared normal dependencies instead.
-            let deps: Vec<String> = pkg
-                .dependencies
-                .iter()
-                .filter(|d| d.kind == cargo_metadata::DependencyKind::Normal)
-                .map(|d| d.name.clone())
-                .collect();
-            if let Some(c) = build_resolved_crate(pkg, true, deps, &out_dir_map)? {
-                crates.push(c);
+        } else {
+            // Full resolution; deps come from the resolve graph.
+            let resolve = metadata
+                .resolve
+                .as_ref()
+                .context("no dependency resolution in metadata")?;
+            for node in &resolve.nodes {
+                let pkg = metadata
+                    .packages
+                    .iter()
+                    .find(|p| p.id == node.id)
+                    .context("package not found in metadata")?;
+                let deps: Vec<String> = node
+                    .deps
+                    .iter()
+                    .filter(|d| {
+                        d.dep_kinds
+                            .iter()
+                            .any(|k| k.kind == cargo_metadata::DependencyKind::Normal)
+                    })
+                    .map(|d| d.name.clone())
+                    .collect();
+                if let Some(c) =
+                    build_resolved_crate(pkg, member_ids.contains(&node.id), deps, &out_dir_map)?
+                {
+                    crates.push(c);
+                }
             }
         }
 
