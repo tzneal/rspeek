@@ -529,10 +529,21 @@ fn run_item_search(
         let all_names: Vec<String> = search_crates
             .iter()
             .flat_map(|c| {
+                // Fast path: use cached name index for registry (immutable) crates.
+                if !c.is_workspace_member {
+                    if let Some(dir) = c.source_dirs.first() {
+                        if crate::cache::is_registry_path(dir) {
+                            if let Some(names) = crate::cache::read_name_index(dir) {
+                                return names;
+                            }
+                        }
+                    }
+                }
                 index::list_items(&c.source_dirs, !c.is_workspace_member, c.out_dir.as_deref())
                     .unwrap_or_default()
                     .into_iter()
                     .map(|e| e.name)
+                    .collect()
             })
             .collect();
         return Err(not_found(
