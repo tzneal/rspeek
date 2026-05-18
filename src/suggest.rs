@@ -56,7 +56,7 @@ mod tests {
 
     #[test]
     fn exact_prefix() {
-        let candidates = vec!["Error", "ErrorKind", "Result"];
+        let candidates = ["Error", "ErrorKind", "Result"];
         let suggs = suggestions("Err", candidates.iter().copied());
         assert!(suggs.contains(&"Error"));
         assert!(suggs.contains(&"ErrorKind"));
@@ -64,21 +64,21 @@ mod tests {
 
     #[test]
     fn typo() {
-        let candidates = vec!["Context", "Chain", "Error", "Result"];
+        let candidates = ["Context", "Chain", "Error", "Result"];
         let suggs = suggestions("Contxt", candidates.iter().copied());
         assert!(suggs.contains(&"Context"));
     }
 
     #[test]
     fn no_match() {
-        let candidates = vec!["Error", "Result"];
+        let candidates = ["Error", "Result"];
         let suggs = suggestions("Zzzzzzzzz", candidates.iter().copied());
         assert!(suggs.is_empty());
     }
 
     #[test]
     fn case_insensitive() {
-        let candidates = vec!["Error", "ErrorKind"];
+        let candidates = ["Error", "ErrorKind"];
         let suggs = suggestions("error", candidates.iter().copied());
         assert!(suggs.contains(&"Error"));
     }
